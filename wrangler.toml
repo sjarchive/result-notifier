@@ -1,0 +1,71 @@
+# ==============================================================================
+# Cloudflare Workers Configuration - VMOU Result Notifier
+# ==============================================================================
+# This Worker runs every 5 minutes on Cloudflare's global edge network.
+# It checks https://online.vmou.ac.in/results.aspx for declared results of the
+# M.A. POLITICAL SCIENCE (Semester-II) programme (code MAPSN-2) and dispatches
+# alerts via Resend (Email), Telegram Bot, and Browser Web Push.
+# ==============================================================================
+
+name = "result-notifier"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# ------------------------------------------------------------------------------
+# Cron Triggers (Scheduled Events)
+# Runs every 5 minutes: at minute 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55
+# ------------------------------------------------------------------------------
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ------------------------------------------------------------------------------
+# Cloudflare KV Storage Binding
+# Used to persist state, check timestamps, detected results, and error logs.
+#
+# CREATE YOUR KV NAMESPACE USING:
+#   npx wrangler kv:namespace create RESULTS_KV
+#
+# Replace the id below with the id output by wrangler.
+# ------------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "RESULTS_KV"
+id = "1806d29c9ba14f2db7a11d1a2f2a7ac1"
+preview_id = "1806d29c9ba14f2db7a11d1a2f2a7ac1"
+
+# ------------------------------------------------------------------------------
+# Public Environment Variables (Non-sensitive)
+# ------------------------------------------------------------------------------
+[vars]
+TARGET_URL = "https://online.vmou.ac.in/results.aspx"
+TARGET_SESSION = "JUNE26"
+TARGET_PROGRAMME_CODE = "MAPSN-2"
+TARGET_PROGRAMME_NAME = "M.A. POLITICAL SCIENCE (Semester-II)"
+TIMEZONE = "Asia/Kolkata"
+CHECK_INTERVAL_MINUTES = "5"
+DEAD_MAN_THRESHOLD_MINUTES = "10"
+MAX_RETRIES = "3"
+# Email & Telegram channels are TEMPORARILY DISABLED (Web Push only for now).
+# Re-enable later by setting these to "true" (and restoring the secrets).
+ENABLE_EMAIL = "false"
+ENABLE_TELEGRAM = "false"
+VAPID_PUBLIC_KEY = "BFpXgH_5tSF26iQhC797D92RhsUwwh7TNds43PKgGk6U8zovuSq7ytP71XbN3I6t82ooEwtdbfDqQvCpahKn_68"
+VAPID_SUBJECT = "https://result-notifier.nvy.workers.dev"
+
+# ------------------------------------------------------------------------------
+# SECRETS (Do NOT commit these in plaintext - configure via `wrangler secret put`):
+#
+# NOTE: Email & Telegram channels are TEMPORARILY DISABLED via ENABLE_EMAIL /
+# ENABLE_TELEGRAM vars below. Their secrets are not required for Web Push,
+# which is the only active channel right now.
+# ------------------------------------------------------------------------------
+# DISABLED FOR NOW - not required while channels are disabled:
+# RESEND_API_KEY          -> Your Resend API key (e.g. re_xxxxxx)
+# EMAIL_FROM              -> Sender email address (e.g. VMOU Alert <onboarding@resend.dev> or verified domain)
+# EMAIL_TO                -> Recipient email address
+#
+# DISABLED FOR NOW - not required while channels are disabled:
+# TELEGRAM_BOT_TOKEN      -> Telegram Bot Token from @BotFather (e.g. 123456789:ABCdef...)
+# TELEGRAM_CHAT_ID        -> Target Telegram Chat ID or Channel ID (e.g. 987654321 or -100xxxxxxxx)
+#
+# VAPID_PRIVATE_KEY       -> Web Push private key override (defaults to pre-generated key if omitted)

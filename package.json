@@ -1,0 +1,31 @@
+{
+  "name": "result-notifier",
+  "version": "1.1.0",
+  "description": "Production-ready Cloudflare Worker monitoring VMOU exam results with seconds-level precision and multi-channel notifications (Email, Telegram, Browser Web Push)",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "test": "node test-local.mjs"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "cron-trigger",
+    "vmou",
+    "exam-results",
+    "resend",
+    "telegram-bot",
+    "web-push",
+    "push-notifications"
+  ],
+  "author": "Antigravity Engineering",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.109.2"
+  },
+  "dependencies": {
+    "@mmmike/web-push": "^1.3.0"
+  }
+}
