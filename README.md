@@ -4,6 +4,7 @@ A production-grade, 100% autonomous serverless monitor built for **Cloudflare Wo
 
 - **Live Dashboard**: [https://result-notifier.nvy.workers.dev/](https://result-notifier.nvy.workers.dev/)
 - Runs 24/7 on Cloudflare's global edge network without requiring your computer to stay on.
+- **Continuous Deployment**: every push to `main` is automatically built and deployed to the Cloudflare Worker via [Workers Builds](https://developers.cloudflare.com/workers/ci-cd/builds/) (`npx wrangler deploy`). The GitHub repo is the source of truth — the monitor keeps running even if the local clone is deleted.
 
 ---
 
