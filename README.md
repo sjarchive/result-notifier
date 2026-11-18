@@ -14,7 +14,7 @@ A production-grade, 100% autonomous serverless monitor built for **Cloudflare Wo
 - **Target Programme**: `M.A. POLITICAL SCIENCE (Semester-II)`
 - **Programme Code**: `MAPSN-2`
 - **Exam Session Filter**: `JUNE26` (the "EXAM SESSION" column on the portal)
-- **Interval**: Every 5 minutes (`*/5 * * * *` Cron Trigger)
+- **Interval**: Every 5 minutes (`*/5 * * * *` Cron Trigger) — **currently PAUSED** (empty `crons` in `wrangler.toml` since 2026-11-18; restore `crons = ["*/5 * * * *"]` to resume)
 - **Deduplication**: Alerts are sent once per detected programme result to avoid repetitive notification spam.
 - **Dead Man's Switch**: If no check has completed for > 10 minutes, triggers an alert state.
 

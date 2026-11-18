@@ -14,10 +14,16 @@ compatibility_flags = ["nodejs_compat"]
 
 # ------------------------------------------------------------------------------
 # Cron Triggers (Scheduled Events)
-# Runs every 5 minutes: at minute 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55
+# PAUSED on 2026-11-18: crons is an empty array, so `wrangler deploy` (run by
+# Workers Builds on every push to main) PUTs an empty schedule list and
+# REMOVES the live */5 cron trigger. The Worker itself stays deployed - the
+# web dashboard and manual endpoints (/, /health, /check-now) keep working;
+# only the automatic 5-minute polling stops.
+# To resume monitoring, restore the schedule below:
+#   crons = ["*/5 * * * *"]
 # ------------------------------------------------------------------------------
 [triggers]
-crons = ["*/5 * * * *"]
+crons = []
 
 # ------------------------------------------------------------------------------
 # Cloudflare KV Storage Binding
