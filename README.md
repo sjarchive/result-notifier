@@ -14,7 +14,7 @@ A production-grade, 100% autonomous serverless monitor built for **Cloudflare Wo
 - **Target Programme**: `M.A. POLITICAL SCIENCE (Semester-II)`
 - **Programme Code**: `MAPSN-2`
 - **Exam Session Filter**: `JUNE26` (the "EXAM SESSION" column on the portal)
-- **Interval**: Every 5 minutes (`*/5 * * * *` Cron Trigger) — **currently PAUSED** (empty `crons` in `wrangler.toml` since 2026-11-18; restore `crons = ["*/5 * * * *"]` to resume)
+- **Interval**: Every 5 minutes (`*/5 * * * *` Cron Trigger) — **currently PAUSED** via `CRON_PAUSED = "true"` in `wrangler.toml` (since 2026-11-18; set it to `"false"` and push to resume)
 - **Deduplication**: Alerts are sent once per detected programme result to avoid repetitive notification spam.
 - **Dead Man's Switch**: If no check has completed for > 10 minutes, triggers an alert state.
 
@@ -310,6 +310,12 @@ npx wrangler delete
 2. Go to **Workers & Pages** -> Select `result-notifier`.
 3. Go to **Triggers** -> **Cron Triggers**.
 4. Disable or delete the `*/5 * * * *` schedule.
+
+### Option C: Pause via the `CRON_PAUSED` Flag (currently active)
+The worker is currently paused this way (since 2026-11-18):
+1. `wrangler.toml` sets `CRON_PAUSED = "true"` under `[vars]`, which makes the scheduled handler exit immediately — no portal polling, notifications or KV writes.
+2. The `*/5 * * * *` cron trigger is intentionally kept in `[triggers]` and still fires as a no-op invocation: deploying `crons = []` (or removing the section) does **not** delete an already-deployed schedule — Cloudflare ignores empty schedule updates (verified 2026-11-18).
+3. **To resume monitoring**: set `CRON_PAUSED = "false"` in `wrangler.toml`, commit and push — Workers Builds redeploys automatically.
 
 ---
 

@@ -273,6 +273,14 @@ export default {
     const scheduledTime = controller.scheduledTime;
     const cronExpression = controller.cron;
 
+    // Monitoring PAUSED via CRON_PAUSED (wrangler.toml [vars]): exit before
+    // doing any work. The trigger still fires, but no portal checks,
+    // notifications or KV writes happen. Set CRON_PAUSED = "false" to resume.
+    if ((env.CRON_PAUSED || '').trim().toLowerCase() === 'true') {
+      logger.info(`[Scheduled Event] Cron "${cronExpression}" fired but monitoring is PAUSED (CRON_PAUSED=true) - skipping`);
+      return;
+    }
+
     logger.info(`[Scheduled Event] Cron trigger fired: "${cronExpression}" (Scheduled: ${new Date(scheduledTime).toISOString()})`);
 
     // Use ctx.waitUntil to ensure asynchronous execution finishes before worker exits

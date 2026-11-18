@@ -14,16 +14,15 @@ compatibility_flags = ["nodejs_compat"]
 
 # ------------------------------------------------------------------------------
 # Cron Triggers (Scheduled Events)
-# PAUSED on 2026-11-18: crons is an empty array, so `wrangler deploy` (run by
-# Workers Builds on every push to main) PUTs an empty schedule list and
-# REMOVES the live */5 cron trigger. The Worker itself stays deployed - the
-# web dashboard and manual endpoints (/, /health, /check-now) keep working;
-# only the automatic 5-minute polling stops.
-# To resume monitoring, restore the schedule below:
-#   crons = ["*/5 * * * *"]
+# NOTE: the schedule is intentionally KEPT here. Cloudflare ignores empty
+# schedule updates: deploying crons = [] (verified 2026-11-18) or removing
+# this section entirely does NOT delete an already-deployed trigger.
+# PAUSING is done via the CRON_PAUSED variable in [vars] instead: the cron
+# still fires every 5 minutes, but the scheduled handler exits immediately,
+# so no portal polling, notifications or KV writes happen.
 # ------------------------------------------------------------------------------
 [triggers]
-crons = []
+crons = ["*/5 * * * *"]
 
 # ------------------------------------------------------------------------------
 # Cloudflare KV Storage Binding
@@ -43,6 +42,10 @@ preview_id = "1806d29c9ba14f2db7a11d1a2f2a7ac1"
 # Public Environment Variables (Non-sensitive)
 # ------------------------------------------------------------------------------
 [vars]
+# PAUSED on 2026-11-18: when "true", the cron-triggered scheduled handler
+# exits immediately (no VMOU polling, notifications or KV writes).
+# To resume monitoring, set this to "false" and push (auto-deploys).
+CRON_PAUSED = "true"
 TARGET_URL = "https://online.vmou.ac.in/results.aspx"
 TARGET_SESSION = "JUNE26"
 TARGET_PROGRAMME_CODE = "MAPSN-2"
