@@ -715,6 +715,11 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
       line-height: 1.5;
     }
+    @media (hover: none) and (pointer: coarse) {
+      body {
+        -webkit-touch-callout: none; /* disable long-press callout on iOS */
+      }
+    }
     .container {
       max-width: 900px;
       margin: 0 auto;
@@ -933,6 +938,13 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
 
   <script>
     const VAPID_PUBLIC_KEY = '${escapeHtml(vapidPublicKey)}';
+
+    // Disable right-click / long-press context menu on mobile phones only
+    const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+      || (navigator.maxTouchPoints > 1 && window.matchMedia('(hover: none) and (pointer: coarse)').matches);
+    if (isMobile) {
+      document.addEventListener('contextmenu', (e) => e.preventDefault());
+    }
 
     function urlBase64ToUint8Array(base64String) {
       const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
