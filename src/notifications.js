@@ -20,12 +20,34 @@ import {
   logger,
   formatIST,
   escapeHtml,
+  sanitizeHttpUrl,
   getPushSubscriptions,
   prunePushSubscriptions,
   DEFAULT_VAPID_PUBLIC_KEY,
   DEFAULT_VAPID_PRIVATE_KEY,
   DEFAULT_VAPID_SUBJECT
 } from './utils.js';
+
+const NOTIFICATION_FETCH_TIMEOUT_MS = 15000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = NOTIFICATION_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Notification request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
 
 /**
  * Channel enablement flags (configurable via env vars in wrangler.toml).
@@ -73,8 +95,13 @@ export async function sendEmail(env, { matches = [], portalUrl, checkTimestampIS
     };
   }
 
-  const courseTitles = matches.map(m => m.courseName).join(', ');
-  const subject = `🎓 VMOU Results Declared: ${matches.map(m => m.targetKey || m.courseName).slice(0, 2).join(' & ')}`;
+  const safePortalUrl = sanitizeHttpUrl(portalUrl);
+  const escapedPortalUrl = escapeHtml(safePortalUrl);
+  const escapedTimestampIST = escapeHtml(checkTimestampIST || formatIST(new Date()));
+  const escapedTimestampISO = escapeHtml(checkTimestampISO || new Date().toISOString());
+
+  const subjectTarget = matches.map(m => m.targetKey || m.courseName).slice(0, 2).join(' & ') || 'VMOU Results';
+  const subject = `🎓 VMOU Results Declared: ${subjectTarget}`;
 
   // Construct Cards for Each Detected Course
   const coursesHtml = matches.map(m => `
@@ -126,7 +153,7 @@ export async function sendEmail(env, { matches = [], portalUrl, checkTimestampIS
               <div style="background-color: #dcfce7; border: 1px solid #86efac; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; display: flex; align-items: center;">
                 <span style="font-size: 20px; margin-right: 12px;">✅</span>
                 <span style="color: #14532d; font-size: 14px; font-weight: 600;">
-                  ${matches.length} target course result${matches.length > 1 ? 's have' : ' has'} been published.
+                  ${matches.length} target course result${matches.length === 1 ? ' has' : 's have'} been published.
                 </span>
               </div>
 
@@ -140,7 +167,7 @@ export async function sendEmail(env, { matches = [], portalUrl, checkTimestampIS
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top: 28px; margin-bottom: 24px;">
                 <tr>
                   <td align="center">
-                    <a href="${portalUrl}" target="_blank" style="display: inline-block; background-color: #134a5c; color: #ffffff; font-size: 16px; font-weight: 700; text-decoration: none; padding: 14px 32px; border-radius: 8px; box-shadow: 0 4px 6px rgba(19, 74, 92, 0.3);">
+                    <a href="${escapedPortalUrl}" target="_blank" style="display: inline-block; background-color: #134a5c; color: #ffffff; font-size: 16px; font-weight: 700; text-decoration: none; padding: 14px 32px; border-radius: 8px; box-shadow: 0 4px 6px rgba(19, 74, 92, 0.3);">
                       🔗 Check Results on VMOU Portal &rarr;
                     </a>
                   </td>
@@ -149,9 +176,9 @@ export async function sendEmail(env, { matches = [], portalUrl, checkTimestampIS
 
               <!-- Metadata Box -->
               <div style="border-top: 1px solid #e2e8f0; padding-top: 20px; margin-top: 24px; font-size: 12px; color: #64748b; line-height: 1.6;">
-                <div><strong>Detection Timestamp:</strong> ${checkTimestampIST || formatIST(new Date())}</div>
-                <div><strong>UTC Timestamp:</strong> ${checkTimestampISO || new Date().toISOString()}</div>
-                <div><strong>Target Portal:</strong> <a href="${portalUrl}" style="color: #134a5c;">${portalUrl}</a></div>
+                <div><strong>Detection Timestamp:</strong> ${escapedTimestampIST}</div>
+                <div><strong>UTC Timestamp:</strong> ${escapedTimestampISO}</div>
+                <div><strong>Target Portal:</strong> <a href="${escapedPortalUrl}" style="color: #134a5c;">${escapedPortalUrl}</a></div>
               </div>
             </td>
           </tr>
@@ -175,7 +202,7 @@ export async function sendEmail(env, { matches = [], portalUrl, checkTimestampIS
   try {
     logger.info(`[Resend Email] Dispatching alert to ${toEmail}...`);
 
-    const response = await fetch('https://api.resend.com/emails', {
+    const response = await fetchWithTimeout('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -251,6 +278,9 @@ export async function sendTelegram(env, { matches = [], portalUrl, checkTimestam
     };
   }
 
+  const safePortalUrl = sanitizeHttpUrl(portalUrl);
+  const escapedPortalUrl = escapeHtml(safePortalUrl);
+
   // Build HTML formatted message
   const courseItems = matches.map(m =>
     `📌 <b>${escapeHtml(m.courseName)}</b>\n   🗓️ <i>Declared on: ${escapeHtml(m.declaredDate || 'Today')}</i>\n   📂 <i>${escapeHtml(m.category || 'Declared Results')}</i>`
@@ -262,7 +292,7 @@ export async function sendTelegram(env, { matches = [], portalUrl, checkTimestam
     ``,
     courseItems,
     ``,
-    `🔗 <b>Direct Portal Link:</b> <a href="${portalUrl}">${portalUrl}</a>`,
+    `🔗 <b>Direct Portal Link:</b> <a href="${escapedPortalUrl}">${escapedPortalUrl}</a>`,
     `⏱️ <b>Detected:</b> <code>${escapeHtml(checkTimestampIST || formatIST(new Date()))}</code>`,
     `⚡ <i>Cloudflare Workers Edge Monitor (24/7)</i>`
   ].join('\n');
@@ -273,7 +303,7 @@ export async function sendTelegram(env, { matches = [], portalUrl, checkTimestam
       [
         {
           text: '🔗 Open VMOU Result Portal',
-          url: portalUrl
+          url: safePortalUrl
         }
       ]
     ]
@@ -283,7 +313,7 @@ export async function sendTelegram(env, { matches = [], portalUrl, checkTimestam
     logger.info(`[Telegram Bot] Sending message to Chat ID ${chatId}...`);
     const endpoint = `https://api.telegram.org/bot${botToken}/sendMessage`;
 
-    const response = await fetch(endpoint, {
+    const response = await fetchWithTimeout(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -332,7 +362,7 @@ export async function sendTelegram(env, { matches = [], portalUrl, checkTimestam
  * ------------------------------------------------------------------------------
  * Pushes instant native notifications to all subscribed browsers.
  */
-export async function sendWebPush(env, { matches = [], portalUrl, checkTimestampIST }) {
+export async function sendWebPush(env, { matches = [], portalUrl }) {
   const kv = env.RESULTS_KV || null;
   const subscriptions = await getPushSubscriptions(kv);
 
@@ -367,7 +397,7 @@ export async function sendWebPush(env, { matches = [], portalUrl, checkTimestamp
   const payload = {
     title,
     body,
-    url: portalUrl || 'https://online.vmou.ac.in/results.aspx',
+    url: sanitizeHttpUrl(portalUrl),
     tag: 'vmou-result-alert'
   };
 
@@ -381,7 +411,7 @@ export async function sendWebPush(env, { matches = [], portalUrl, checkTimestamp
 
     // Defensive access: the library documents { delivered, gone[], failed[] }
     // but guard against unexpected shapes so a library change cannot crash the cron run.
-    const delivered = result?.delivered ?? 0;
+    const delivered = typeof result?.delivered === 'number' ? result.delivered : 0;
     const goneEndpoints = Array.isArray(result?.gone) ? result.gone : [];
     const failedSends = Array.isArray(result?.failed) ? result.failed : [];
 
@@ -394,19 +424,21 @@ export async function sendWebPush(env, { matches = [], portalUrl, checkTimestamp
 
     return {
       channel: 'webpush',
-      // Success requires at least one real delivery. A batch where every
-      // subscription has expired (delivered = 0, gone > 0) is NOT a success.
-      success: delivered > 0 || (failedSends.length === 0 && goneEndpoints.length === 0),
+      // Success strictly requires at least one real delivery
+      success: delivered > 0,
       delivered,
       subscribers: subscriptions.length,
       gone: goneEndpoints.length,
-      failed: failedSends.length
+      failed: failedSends.length,
+      ...(delivered === 0 ? { error: 'No push notifications were delivered' } : {})
     };
   } catch (err) {
     logger.error(`[Web Push] Delivery error: ${err.message}`);
     return {
       channel: 'webpush',
       success: false,
+      delivered: 0,
+      subscribers: subscriptions.length,
       error: err.message
     };
   }
@@ -425,7 +457,7 @@ export async function sendWebPush(env, { matches = [], portalUrl, checkTimestamp
  */
 export async function notifyAllChannels(env, checkResult) {
   const matches = checkResult.matches || [];
-  const portalUrl = checkResult.portalUrl || 'https://online.vmou.ac.in/results.aspx';
+  const portalUrl = sanitizeHttpUrl(checkResult.portalUrl);
   const checkTimestampIST = checkResult.checkTimestampIST;
   const checkTimestampISO = checkResult.checkTimestamp;
 
@@ -456,7 +488,7 @@ export async function notifyAllChannels(env, checkResult) {
 
   const failedChannels = Object.entries(report)
     .filter(([_, res]) => !res.success && !res.skipped)
-    .map(([channel, res]) => `${channel} (${res.error})`);
+    .map(([channel, res]) => `${channel} (${res.error || 'unknown error'})`);
 
   const skippedChannels = Object.entries(report)
     .filter(([_, res]) => res.skipped)
@@ -478,5 +510,3 @@ export async function notifyAllChannels(env, checkResult) {
     anySucceeded: successfulChannels.length > 0
   };
 }
-
-// Basic HTML escaping helper lives in utils.js (shared with the dashboard).

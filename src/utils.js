@@ -5,11 +5,38 @@
  * Comprehensive helper functions for:
  * 1. Precision logging with milliseconds & IST timezone
  * 2. Asynchronous retry logic with exponential backoff & jitter
- * 3. Cloudflare KV state storage management
+ * 3. Cloudflare KV state storage management (with in-memory fallback)
  * 4. Dead man's switch detection
- * 5. Notification deduplication fingerprints
+ * 5. Notification deduplication fingerprints & cooldown tracking
+ * 6. Web Push subscription persistence & validation
  * ==============================================================================
  */
+
+/**
+ * Safely parse an integer from environment variables or strings.
+ * Prevents NaN propagation when env vars are missing, empty, or malformed.
+ *
+ * @param {string|number|undefined|null} value
+ * @param {number} fallback
+ * @param {{ min?: number, max?: number }} options
+ * @returns {number}
+ */
+export function parseSafeInt(value, fallback, { min = -Infinity, max = Infinity } = {}) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = Number.parseInt(String(value).trim(), 10);
+  if (Number.isNaN(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+/**
+ * Determine whether scheduled cron monitoring is paused via CRON_PAUSED env var.
+ *
+ * @param {Object} env
+ * @returns {boolean}
+ */
+export function isCronPaused(env = {}) {
+  return String(env?.CRON_PAUSED ?? 'false').trim().toLowerCase() === 'true';
+}
 
 /**
  * Format a Date object into human-readable Indian Standard Time (IST, UTC+5:30).
@@ -20,7 +47,7 @@
  */
 export function formatIST(dateInput = new Date()) {
   const date = typeof dateInput === 'object' && dateInput instanceof Date ? dateInput : new Date(dateInput);
-  if (isNaN(date.getTime())) return 'Invalid Date';
+  if (Number.isNaN(date.getTime())) return 'Invalid Date';
 
   try {
     const formatter = new Intl.DateTimeFormat('en-IN', {
@@ -57,13 +84,33 @@ export function getNowIso() {
  * @returns {string}
  */
 export function escapeHtml(str) {
-  if (!str) return '';
+  if (str === undefined || str === null) return '';
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/**
+ * Validate and sanitize an external HTTP/HTTPS URL before embedding in HTML/links.
+ *
+ * @param {string} url
+ * @param {string} fallback
+ * @returns {string}
+ */
+export function sanitizeHttpUrl(url, fallback = 'https://online.vmou.ac.in/results.aspx') {
+  if (!url || typeof url !== 'string') return fallback;
+  try {
+    const parsed = new URL(url.trim());
+    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+      return parsed.toString();
+    }
+    return fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 /**
@@ -76,7 +123,7 @@ export const logger = {
     const now = new Date();
     const iso = now.toISOString();
     const ist = formatIST(now);
-    const metaStr = Object.keys(meta).length ? ` | ${JSON.stringify(meta)}` : '';
+    const metaStr = meta && Object.keys(meta).length ? ` | ${JSON.stringify(meta)}` : '';
     return `[${iso}] [${ist}] [${level.toUpperCase()}] ${message}${metaStr}`;
   },
 
@@ -99,7 +146,7 @@ export const logger = {
 
 /**
  * Sleep helper for retry backoff.
- * @param {number} ms 
+ * @param {number} ms
  * @returns {Promise<void>}
  */
 export function sleep(ms) {
@@ -123,25 +170,26 @@ export async function withRetry(fn, {
   maxDelayMs = 8000,
   context = 'operation'
 } = {}) {
+  const safeMaxRetries = parseSafeInt(maxRetries, 3, { min: 0, max: 10 });
   let attempt = 0;
   let lastError;
 
-  while (attempt <= maxRetries) {
+  while (attempt <= safeMaxRetries) {
     try {
       const startTime = Date.now();
       const result = await fn(attempt);
       const durationMs = Date.now() - startTime;
       if (attempt > 0) {
-        logger.info(`[${context}] Succeeded on retry attempt ${attempt}/${maxRetries} (${durationMs}ms)`);
+        logger.info(`[${context}] Succeeded on retry attempt ${attempt}/${safeMaxRetries} (${durationMs}ms)`);
       }
       return result;
     } catch (err) {
       lastError = err;
       attempt++;
 
-      if (attempt > maxRetries) {
-        logger.error(`[${context}] Failed after ${maxRetries} retries: ${err.message}`, {
-          stack: err.stack
+      if (attempt > safeMaxRetries) {
+        logger.error(`[${context}] Failed after ${safeMaxRetries} retries: ${err?.message || err}`, {
+          stack: err?.stack
         });
         break;
       }
@@ -150,7 +198,7 @@ export async function withRetry(fn, {
       const jitter = Math.floor(Math.random() * 500);
       const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1) + jitter, maxDelayMs);
 
-      logger.warn(`[${context}] Attempt ${attempt}/${maxRetries} failed: ${err.message}. Retrying in ${delay}ms...`);
+      logger.warn(`[${context}] Attempt ${attempt}/${safeMaxRetries} failed: ${err?.message || err}. Retrying in ${delay}ms...`);
       await sleep(delay);
     }
   }
@@ -177,20 +225,30 @@ const DEFAULT_STATE = {
   detectedResults: [],
   notifiedFingerprints: [],
   lastNotificationTimestamp: null,
+  lastNotificationTimestampIST: null,
   lastNotificationStatus: null,
+  lastTestNotificationTimestamp: null,
   errorHistory: []
 };
 
+// In-memory state fallback for local dev/testing without a bound KV namespace
+let inMemoryState = { ...DEFAULT_STATE };
+
 /**
- * Retrieve current monitor state from Cloudflare KV.
+ * Retrieve current monitor state from Cloudflare KV (or in-memory fallback).
  *
  * @param {KVNamespace|null} kv
  * @returns {Promise<Object>}
  */
 export async function getState(kv) {
   if (!kv) {
-    logger.warn('KV namespace not bound. Running with in-memory state defaults.');
-    return { ...DEFAULT_STATE };
+    return {
+      ...DEFAULT_STATE,
+      ...inMemoryState,
+      detectedResults: [...(inMemoryState.detectedResults || [])],
+      notifiedFingerprints: [...(inMemoryState.notifiedFingerprints || [])],
+      errorHistory: [...(inMemoryState.errorHistory || [])]
+    };
   }
 
   try {
@@ -205,17 +263,25 @@ export async function getState(kv) {
 }
 
 /**
- * Persist updated monitor state to Cloudflare KV.
+ * Persist updated monitor state to Cloudflare KV (or in-memory fallback).
  *
  * @param {KVNamespace|null} kv
  * @param {Object} partialState
+ * @param {Object|null} existingState Optional pre-loaded state to avoid a redundant KV read
  * @returns {Promise<Object>}
  */
-export async function updateState(kv, partialState) {
-  if (!kv) return partialState;
+export async function updateState(kv, partialState, existingState = null) {
+  if (!kv) {
+    inMemoryState = {
+      ...DEFAULT_STATE,
+      ...inMemoryState,
+      ...partialState
+    };
+    return await getState(null);
+  }
 
   try {
-    const currentState = await getState(kv);
+    const currentState = existingState || await getState(kv);
     const updatedState = {
       ...currentState,
       ...partialState
@@ -224,7 +290,7 @@ export async function updateState(kv, partialState) {
     return updatedState;
   } catch (err) {
     logger.error(`Failed to write state to KV: ${err.message}`);
-    return partialState;
+    return { ...(existingState || DEFAULT_STATE), ...partialState };
   }
 }
 
@@ -248,7 +314,7 @@ export async function recordCheckSuccess(kv, checkResult, durationMs) {
     consecutiveErrors: 0,
     lastError: null,
     detectedResults: checkResult.matches || []
-  });
+  }, currentState);
 }
 
 /**
@@ -281,7 +347,7 @@ export async function recordCheckError(kv, error, durationMs) {
     consecutiveErrors: (currentState.consecutiveErrors || 0) + 1,
     lastError: errorMessage,
     errorHistory
-  });
+  }, currentState);
 }
 
 /**
@@ -313,8 +379,9 @@ export function shouldDispatchNotification(state, currentMatches = []) {
   if (!currentMatches || currentMatches.length === 0) return false;
 
   const currentFingerprint = computeResultsFingerprint(currentMatches);
-  const notified = state.notifiedFingerprints || [];
+  if (!currentFingerprint) return false;
 
+  const notified = state?.notifiedFingerprints || [];
   return !notified.includes(currentFingerprint);
 }
 
@@ -323,28 +390,41 @@ export function shouldDispatchNotification(state, currentMatches = []) {
 const MAX_NOTIFIED_FINGERPRINTS = 50;
 
 /**
- * Record that notification was sent for current fingerprint.
+ * Record that notification was successfully dispatched for current fingerprint.
+ * Only call this after at least one channel actually delivered, so failed
+ * dispatches do not permanently suppress future alerts.
  *
  * @param {KVNamespace|null} kv
  * @param {Array<Object>} matches
  * @param {Object} notificationStatus
+ * @param {{ markFingerprintNotified?: boolean }} options
  */
-export async function recordNotificationDispatched(kv, matches, notificationStatus) {
+export async function recordNotificationDispatched(
+  kv,
+  matches,
+  notificationStatus,
+  { markFingerprintNotified = true } = {}
+) {
   const now = new Date();
-  const fingerprint = computeResultsFingerprint(matches);
   const currentState = await getState(kv);
 
-  const updatedFingerprints = Array.from(new Set([
-    ...(currentState.notifiedFingerprints || []),
-    fingerprint
-  ])).filter(Boolean).slice(-MAX_NOTIFIED_FINGERPRINTS);
+  const patch = {
+    lastNotificationStatus: notificationStatus
+  };
 
-  return await updateState(kv, {
-    lastNotificationTimestamp: now.toISOString(),
-    lastNotificationTimestampIST: formatIST(now),
-    lastNotificationStatus: notificationStatus,
-    notifiedFingerprints: updatedFingerprints
-  });
+  if (markFingerprintNotified) {
+    const fingerprint = computeResultsFingerprint(matches);
+    const updatedFingerprints = Array.from(new Set([
+      ...(currentState.notifiedFingerprints || []),
+      fingerprint
+    ])).filter(Boolean).slice(-MAX_NOTIFIED_FINGERPRINTS);
+
+    patch.lastNotificationTimestamp = now.toISOString();
+    patch.lastNotificationTimestampIST = formatIST(now);
+    patch.notifiedFingerprints = updatedFingerprints;
+  }
+
+  return await updateState(kv, patch, currentState);
 }
 
 // Key for in-flight notification dispatch lock in KV
@@ -362,23 +442,28 @@ let inMemoryLockUntil = 0;
  */
 export async function acquireDispatchLock(kv, ttlSeconds = 60) {
   const now = Date.now();
+  const safeTtl = parseSafeInt(ttlSeconds, 60, { min: 1, max: 3600 });
 
   if (!kv) {
     if (inMemoryLockUntil > now) {
       return false;
     }
-    inMemoryLockUntil = now + (ttlSeconds * 1000);
+    inMemoryLockUntil = now + (safeTtl * 1000);
     return true;
   }
 
   try {
     const existingLock = await kv.get(KV_DISPATCH_LOCK_KEY);
     if (existingLock) {
-      const lockData = JSON.parse(existingLock);
-      // If active lock exists and has not expired, block concurrent execution
-      if (lockData.expiresAt && lockData.expiresAt > now) {
-        logger.warn(`Dispatch lock currently active (held by instance ${lockData.holderId || 'unknown'}).`);
-        return false;
+      try {
+        const lockData = JSON.parse(existingLock);
+        // If active lock exists and has not expired, block concurrent execution
+        if (lockData.expiresAt && lockData.expiresAt > now) {
+          logger.warn(`Dispatch lock currently active (held by instance ${lockData.holderId || 'unknown'}).`);
+          return false;
+        }
+      } catch {
+        logger.warn('Ignoring corrupt dispatch lock payload in KV and overwriting.');
       }
     }
 
@@ -386,19 +471,19 @@ export async function acquireDispatchLock(kv, ttlSeconds = 60) {
     const lockPayload = JSON.stringify({
       holderId,
       acquiredAt: new Date(now).toISOString(),
-      expiresAt: now + (ttlSeconds * 1000)
+      expiresAt: now + (safeTtl * 1000)
     });
 
     // Cloudflare KV expirationTtl must be >= 60 seconds
     await kv.put(KV_DISPATCH_LOCK_KEY, lockPayload, {
-      expirationTtl: Math.max(60, ttlSeconds)
+      expirationTtl: Math.max(60, safeTtl)
     });
 
     return true;
   } catch (err) {
     logger.warn(`Failed to verify dispatch lock in KV: ${err.message}. Using in-memory mutex.`);
     if (inMemoryLockUntil > now) return false;
-    inMemoryLockUntil = now + (ttlSeconds * 1000);
+    inMemoryLockUntil = now + (safeTtl * 1000);
     return true;
   }
 }
@@ -424,20 +509,26 @@ export async function releaseDispatchLock(kv) {
  *
  * @param {Object} state Monitor state
  * @param {number} cooldownMinutes Minimum minutes between notifications (default: 5)
+ * @param {string} timestampField State timestamp key to evaluate
  * @returns {{ inCooldown: boolean, remainingSeconds: number, elapsedSeconds: number }}
  */
-export function checkNotificationCooldown(state, cooldownMinutes = 5) {
-  if (!state || !state.lastNotificationTimestamp) {
+export function checkNotificationCooldown(
+  state,
+  cooldownMinutes = 5,
+  timestampField = 'lastNotificationTimestamp'
+) {
+  const rawTimestamp = state?.[timestampField];
+  if (!rawTimestamp) {
     return { inCooldown: false, remainingSeconds: 0, elapsedSeconds: Infinity };
   }
 
-  const lastNotifTime = new Date(state.lastNotificationTimestamp).getTime();
-  if (isNaN(lastNotifTime)) {
+  const lastNotifTime = new Date(rawTimestamp).getTime();
+  if (Number.isNaN(lastNotifTime)) {
     return { inCooldown: false, remainingSeconds: 0, elapsedSeconds: Infinity };
   }
 
   const cooldownMs = cooldownMinutes * 60 * 1000;
-  const elapsedMs = Date.now() - lastNotifTime;
+  const elapsedMs = Math.max(0, Date.now() - lastNotifTime);
 
   if (elapsedMs < cooldownMs) {
     const remainingSeconds = Math.ceil((cooldownMs - elapsedMs) / 1000);
@@ -450,39 +541,77 @@ export function checkNotificationCooldown(state, cooldownMinutes = 5) {
 
 /**
  * Dead Man's Switch: Check if the worker missed scheduled runs.
- * If more than `thresholdMinutes` have passed since the last check,
- * the switch is tripped.
+ * If more than `thresholdMinutes` have passed since the last check (and
+ * monitoring is not paused), the switch is tripped.
  *
  * @param {Object} state
  * @param {number} thresholdMinutes
- * @returns {{ tripped: boolean, elapsedSeconds: number, elapsedMinutes: number, message: string }}
+ * @param {{ paused?: boolean }} options
+ * @returns {{ tripped: boolean, paused: boolean, elapsedSeconds: number, elapsedMinutes: number, thresholdMinutes: number, message: string }}
  */
-export function evaluateDeadManSwitch(state, thresholdMinutes = 10) {
+export function evaluateDeadManSwitch(state, thresholdMinutes = 10, { paused = false } = {}) {
+  const safeThreshold = parseSafeInt(thresholdMinutes, 10, { min: 1, max: 1440 });
+
+  let elapsedSeconds = 0;
+  let elapsedMinutes = 0;
+  let hasValidTimestamp = false;
+
+  if (state && state.lastCheckTimestamp) {
+    const lastCheckTime = new Date(state.lastCheckTimestamp).getTime();
+    if (!Number.isNaN(lastCheckTime)) {
+      hasValidTimestamp = true;
+      const elapsedMs = Math.max(0, Date.now() - lastCheckTime);
+      elapsedSeconds = Math.round(elapsedMs / 1000);
+      elapsedMinutes = Number((elapsedMs / (60 * 1000)).toFixed(1));
+    }
+  }
+
+  if (paused) {
+    return {
+      tripped: false,
+      paused: true,
+      elapsedSeconds,
+      elapsedMinutes,
+      thresholdMinutes: safeThreshold,
+      message: 'Monitoring is paused (CRON_PAUSED=true).'
+    };
+  }
+
   if (!state || !state.lastCheckTimestamp) {
     return {
       tripped: false,
+      paused: false,
       elapsedSeconds: 0,
       elapsedMinutes: 0,
+      thresholdMinutes: safeThreshold,
       message: 'Initial check has not run yet.'
     };
   }
 
-  const lastCheckTime = new Date(state.lastCheckTimestamp).getTime();
-  const now = Date.now();
-  const elapsedMs = Math.max(0, now - lastCheckTime);
-  const elapsedSeconds = Math.round(elapsedMs / 1000);
-  const elapsedMinutes = (elapsedMs / (60 * 1000)).toFixed(1);
-  const thresholdMs = thresholdMinutes * 60 * 1000;
+  if (!hasValidTimestamp) {
+    return {
+      tripped: false,
+      paused: false,
+      elapsedSeconds: 0,
+      elapsedMinutes: 0,
+      thresholdMinutes: safeThreshold,
+      message: 'Invalid last check timestamp recorded.'
+    };
+  }
 
+  const lastCheckTime = new Date(state.lastCheckTimestamp).getTime();
+  const elapsedMs = Math.max(0, Date.now() - lastCheckTime);
+  const thresholdMs = safeThreshold * 60 * 1000;
   const tripped = elapsedMs > thresholdMs;
 
   return {
     tripped,
+    paused: false,
     elapsedSeconds,
-    elapsedMinutes: Number(elapsedMinutes),
-    thresholdMinutes,
+    elapsedMinutes,
+    thresholdMinutes: safeThreshold,
     message: tripped
-      ? `DEAD MAN'S SWITCH TRIPPED: No check has run for ${elapsedMinutes} minutes (Threshold: ${thresholdMinutes}m)!`
+      ? `DEAD MAN'S SWITCH TRIPPED: No check has run for ${elapsedMinutes} minutes (Threshold: ${safeThreshold}m)!`
       : `Operational: Last check was ${elapsedMinutes} minutes ago.`
   };
 }
@@ -504,6 +633,52 @@ const KV_PUSH_SUBS_KEY = 'mlsu_push_subscriptions';
 let inMemoryPushSubs = [];
 
 /**
+ * Reset in-memory fallback stores (used by unit tests for isolation).
+ */
+export function resetInMemoryState() {
+  inMemoryState = { ...DEFAULT_STATE };
+  inMemoryPushSubs = [];
+  inMemoryLockUntil = 0;
+}
+
+/**
+ * Validate a Web Push subscription object before persisting.
+ *
+ * @param {Object} subscription
+ * @returns {{ valid: boolean, error?: string }}
+ */
+export function validatePushSubscription(subscription) {
+  if (!subscription || typeof subscription !== 'object') {
+    return { valid: false, error: 'Missing push subscription object' };
+  }
+  if (typeof subscription.endpoint !== 'string' || !subscription.endpoint.trim()) {
+    return { valid: false, error: 'Missing push subscription endpoint' };
+  }
+
+  try {
+    const parsedUrl = new URL(subscription.endpoint.trim());
+    if (parsedUrl.protocol !== 'https:' && parsedUrl.hostname !== 'localhost' && parsedUrl.hostname !== '127.0.0.1') {
+      return { valid: false, error: 'Push subscription endpoint must use HTTPS' };
+    }
+  } catch {
+    return { valid: false, error: 'Push subscription endpoint must be a valid URL' };
+  }
+
+  if (
+    !subscription.keys ||
+    typeof subscription.keys !== 'object' ||
+    typeof subscription.keys.p256dh !== 'string' ||
+    !subscription.keys.p256dh.trim() ||
+    typeof subscription.keys.auth !== 'string' ||
+    !subscription.keys.auth.trim()
+  ) {
+    return { valid: false, error: 'Push subscription keys (p256dh, auth) are required' };
+  }
+
+  return { valid: true };
+}
+
+/**
  * Retrieve all registered Web Push subscriptions from KV.
  *
  * @param {KVNamespace|null} kv
@@ -511,7 +686,7 @@ let inMemoryPushSubs = [];
  */
 export async function getPushSubscriptions(kv) {
   if (!kv) {
-    return inMemoryPushSubs;
+    return [...inMemoryPushSubs];
   }
 
   try {
@@ -534,8 +709,9 @@ export async function getPushSubscriptions(kv) {
  * @returns {Promise<{ count: number, isNew: boolean }>}
  */
 export async function savePushSubscription(kv, subscription, userAgent = '') {
-  if (!subscription || !subscription.endpoint || !subscription.keys) {
-    throw new Error('Invalid push subscription structure');
+  const validation = validatePushSubscription(subscription);
+  if (!validation.valid) {
+    throw new Error(validation.error || 'Invalid push subscription structure');
   }
 
   const existing = await getPushSubscriptions(kv);
@@ -545,10 +721,10 @@ export async function savePushSubscription(kv, subscription, userAgent = '') {
   const newSubEntry = {
     endpoint: normalizedEndpoint,
     keys: {
-      p256dh: subscription.keys.p256dh,
-      auth: subscription.keys.auth
+      p256dh: subscription.keys.p256dh.trim(),
+      auth: subscription.keys.auth.trim()
     },
-    userAgent: userAgent.slice(0, 200),
+    userAgent: String(userAgent || '').slice(0, 200),
     updatedAt: new Date().toISOString()
   };
 
@@ -570,11 +746,7 @@ export async function savePushSubscription(kv, subscription, userAgent = '') {
   if (!kv) {
     inMemoryPushSubs = updatedList;
   } else {
-    try {
-      await kv.put(KV_PUSH_SUBS_KEY, JSON.stringify(updatedList));
-    } catch (err) {
-      logger.error(`Failed to persist push subscription to KV: ${err.message}`);
-    }
+    await kv.put(KV_PUSH_SUBS_KEY, JSON.stringify(updatedList));
   }
 
   logger.info(`Web Push subscription stored (Total subscribers: ${updatedList.length}, isNew: ${isNew})`);
@@ -589,20 +761,20 @@ export async function savePushSubscription(kv, subscription, userAgent = '') {
  * @returns {Promise<{ count: number, removed: boolean }>}
  */
 export async function removePushSubscription(kv, endpoint) {
-  if (!endpoint) return { count: 0, removed: false };
+  const normalizedEndpoint = typeof endpoint === 'string' ? endpoint.trim() : '';
+  if (!normalizedEndpoint) {
+    const existing = await getPushSubscriptions(kv);
+    return { count: existing.length, removed: false };
+  }
 
   const existing = await getPushSubscriptions(kv);
-  const filtered = existing.filter(s => s.endpoint !== endpoint);
+  const filtered = existing.filter(s => s.endpoint !== normalizedEndpoint);
   const removed = filtered.length < existing.length;
 
   if (!kv) {
     inMemoryPushSubs = filtered;
   } else if (removed) {
-    try {
-      await kv.put(KV_PUSH_SUBS_KEY, JSON.stringify(filtered));
-    } catch (err) {
-      logger.error(`Failed to remove push subscription from KV: ${err.message}`);
-    }
+    await kv.put(KV_PUSH_SUBS_KEY, JSON.stringify(filtered));
   }
 
   logger.info(`Web Push subscription removed (Remaining: ${filtered.length})`);
@@ -619,7 +791,14 @@ export async function removePushSubscription(kv, endpoint) {
 export async function prunePushSubscriptions(kv, endpointsToRemove = []) {
   if (!endpointsToRemove || endpointsToRemove.length === 0) return 0;
 
-  const toRemoveSet = new Set(endpointsToRemove);
+  const toRemoveSet = new Set(
+    endpointsToRemove
+      .filter(ep => typeof ep === 'string')
+      .map(ep => ep.trim())
+      .filter(Boolean)
+  );
+  if (toRemoveSet.size === 0) return 0;
+
   const existing = await getPushSubscriptions(kv);
   const filtered = existing.filter(s => !toRemoveSet.has(s.endpoint));
   const prunedCount = existing.length - filtered.length;
@@ -639,4 +818,3 @@ export async function prunePushSubscriptions(kv, endpointsToRemove = []) {
 
   return prunedCount;
 }
-

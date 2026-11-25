@@ -86,17 +86,28 @@ const ROMAN_TO_DIGIT = {
 };
 
 /**
- * Decode common HTML entities.
+ * Decode common HTML entities (named, decimal, and hex).
+ * Decodes &amp; LAST to avoid double-unescaping sequences like &amp;lt;.
  */
-function decodeHtmlEntities(str) {
+export function decodeHtmlEntities(str) {
   if (!str) return '';
-  return str
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ');
+  return String(str)
+    .replace(/&#x([0-9a-fA-F]+);/g, (full, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : full;
+    })
+    .replace(/&#(\d+);/g, (full, dec) => {
+      const code = Number.parseInt(dec, 10);
+      return code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : full;
+    })
+    .replace(/&apos;/gi, "'")
+    .replace(/&quot;/gi, '"')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&ndash;/gi, '-')
+    .replace(/&mdash;/gi, '-')
+    .replace(/&amp;/gi, '&');
 }
 
 /**
@@ -106,7 +117,7 @@ function decodeHtmlEntities(str) {
  *   -> "MA POLITICAL SCIENCE SEM 2"  ->  "MAPOLITICALSCIENCESEM2"
  * Case, dots, dashes, parentheses and spacing variations all collapse away.
  */
-function normalizeProgrammeText(str) {
+export function normalizeProgrammeText(str) {
   if (!str) return '';
   let text = String(str).toUpperCase();
   // Convert standalone roman numerals to digits BEFORE stripping punctuation
@@ -115,6 +126,41 @@ function normalizeProgrammeText(str) {
   text = text.replace(/SEMESTER/g, 'SEM');
   // Strip all non-alphanumeric characters
   return text.replace(/[^A-Z0-9]/g, '');
+}
+
+/**
+ * Build a boundary-safe RegExp for matching a programme code like "MAPSN-2"
+ * against raw uppercase text. Prevents prefix/suffix collisions such as
+ * "MAPSN-2" matching "MAPSN-20", "MAPSN-2A", or "XMAPSN-2".
+ */
+function buildCodeRegex(rawCode) {
+  const parts = String(rawCode || '')
+    .toUpperCase()
+    .split(/[^A-Z0-9]+/)
+    .filter(Boolean)
+    .map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+
+  if (parts.length === 0) return null;
+  const pattern = `(?<![A-Z0-9])${parts.join('[\\s\\-_/]*')}(?![A-Z0-9])`;
+  return new RegExp(pattern, 'i');
+}
+
+/**
+ * Check whether normalized `haystack` contains normalized `needle` without
+ * splitting a trailing number (e.g. "SEM2" must not match "SEM20").
+ */
+function containsNormalizedBoundarySafe(haystack, needle) {
+  if (!haystack || !needle) return false;
+  const endsWithDigit = /\d$/.test(needle);
+  let idx = haystack.indexOf(needle);
+  while (idx !== -1) {
+    const afterChar = haystack[idx + needle.length] || '';
+    if (!endsWithDigit || !/^\d$/.test(afterChar)) {
+      return true;
+    }
+    idx = haystack.indexOf(needle, idx + 1);
+  }
+  return false;
 }
 
 /**
@@ -139,9 +185,37 @@ export function resolveTargetDefinitions(env = {}) {
       name: nameRaw,
       codes,
       normName: normalizeProgrammeText(nameRaw),
-      normCodes: codes.map(normalizeProgrammeText).filter(Boolean)
+      normCodes: codes.map(normalizeProgrammeText).filter(Boolean),
+      codeRegexes: codes.map(buildCodeRegex).filter(Boolean)
     }
   ];
+}
+
+/**
+ * Find the first matching target definition for a given text string.
+ *
+ * @param {string} text Combined programme name + code text
+ * @param {Array<Object>} targets Resolved target definitions
+ * @returns {Object|null}
+ */
+export function findMatchingTarget(text, targets = []) {
+  if (!text || !targets || targets.length === 0) return null;
+  const rawUpper = String(text).toUpperCase();
+  const normalized = normalizeProgrammeText(rawUpper);
+  if (!normalized) return null;
+
+  for (const target of targets) {
+    // Primary: boundary-safe programme-code hit (e.g. "MAPSN-2" without matching "MAPSN-20")
+    const codeRegexes = target.codeRegexes || (target.codes || []).map(buildCodeRegex).filter(Boolean);
+    for (const regex of codeRegexes) {
+      if (regex.test(rawUpper)) return target;
+    }
+    // Secondary: full programme-name hit with digit-boundary guard
+    if (target.normName && containsNormalizedBoundarySafe(normalized, target.normName)) {
+      return target;
+    }
+  }
+  return null;
 }
 
 /**
@@ -153,19 +227,29 @@ export function resolveTargetDefinitions(env = {}) {
  * @returns {boolean}
  */
 export function isTargetProgramme(text, targets = []) {
-  if (!text || targets.length === 0) return false;
-  const normalized = normalizeProgrammeText(text);
-  if (!normalized) return false;
+  return findMatchingTarget(text, targets) !== null;
+}
 
-  for (const target of targets) {
-    // Primary: exact programme-code hit (e.g. "MAPSN2" inside the row text)
-    for (const code of target.normCodes) {
-      if (normalized.includes(code)) return true;
-    }
-    // Secondary: full programme-name hit
-    if (target.normName && normalized.includes(target.normName)) return true;
-  }
-  return false;
+/**
+ * Extract clean text lines from HTML for fallback scanning when table parsing
+ * yields zero rows. Strips script/style/comment blocks and preserves block breaks.
+ *
+ * @param {string} html
+ * @returns {string}
+ */
+export function extractReadableText(html) {
+  if (!html) return '';
+  const stripped = String(html)
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style|noscript)\b[^>]*>[\s\S]*?<\/\1>/gi, '\n')
+    .replace(/<(?:\/(?:tr|div|p|li|h[1-6]|section|article|table)|br\s*\/?)>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ');
+
+  return decodeHtmlEntities(stripped)
+    .split(/[\n\r]+/)
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
 }
 
 /**
@@ -176,15 +260,19 @@ export function isTargetProgramme(text, targets = []) {
  *                          declaration date, and exam session
  */
 export function parseDeclaredResultsTable(html) {
-  const decodedHtml = decodeHtmlEntities(html);
+  if (!html) return [];
+  const rawHtml = String(html);
   const results = [];
 
-  const rowRegex = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+  // Avoid matching outer <tr> elements that wrap nested <tr> tables
+  const rowRegex = /<tr\b[^>]*>((?:(?!<tr\b)[\s\S])*?)<\/tr>/gi;
   let match;
 
-  while ((match = rowRegex.exec(decodedHtml)) !== null) {
+  while ((match = rowRegex.exec(rawHtml)) !== null) {
     const rowHtml = match[1];
-    const textContent = rowHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const textContent = decodeHtmlEntities(rowHtml.replace(/<[^>]+>/g, ' '))
+      .replace(/\s+/g, ' ')
+      .trim();
 
     if (!textContent) continue;
 
@@ -200,7 +288,9 @@ export function parseDeclaredResultsTable(html) {
     let cellMatch;
     while ((cellMatch = cellRegex.exec(rowHtml)) !== null) {
       cells.push(
-        decodeHtmlEntities(cellMatch[1].replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim()
+        decodeHtmlEntities(cellMatch[1].replace(/<[^>]+>/g, ' '))
+          .replace(/\s+/g, ' ')
+          .trim()
       );
     }
     if (cells.length < 5) continue;
@@ -214,6 +304,10 @@ export function parseDeclaredResultsTable(html) {
     // Data rows have a numeric serial number and a non-empty programme name
     if (!/^\d+$/.test(sNo) || !courseName) continue;
 
+    // Extract optional link href if present inside the row
+    const hrefMatch = rowHtml.match(/<a\b[^>]*href=["']([^"']+)["']/i);
+    const actionLink = hrefMatch ? decodeHtmlEntities(hrefMatch[1]).trim() : '';
+
     results.push({
       sNo,
       courseName,
@@ -222,7 +316,7 @@ export function parseDeclaredResultsTable(html) {
       examSession,
       category: examSession ? `Exam Session ${examSession}` : 'Declared Results',
       rawRowText: textContent,
-      actionLink: ''
+      actionLink
     });
   }
 
@@ -235,7 +329,7 @@ export function parseDeclaredResultsTable(html) {
  * @param {Array<Object>} declaredResults
  * @param {Array<Object>} targets       Resolved target definitions
  * @param {string} targetSession        e.g. "JUNE26" ("" disables session filter)
- * @param {string} fullPageText         used for the fallback content scan
+ * @param {string} fullPageText         used ONLY if table parsing yielded 0 rows
  * @returns {Array<Object>} Matched target results
  */
 export function identifyTargetMatches(declaredResults, targets, targetSession = '', fullPageText = '') {
@@ -250,12 +344,15 @@ export function identifyTargetMatches(declaredResults, targets, targetSession = 
       continue;
     }
 
-    if (isTargetProgramme(targetText, targets)) {
+    const matchedTarget = findMatchingTarget(targetText, targets);
+    if (matchedTarget) {
       matches.push({
-        targetDefinitionId: targets[0]?.id || 'TARGET_PROGRAMME',
-        targetKey: item.courseCode || targets[0]?.name || item.courseName,
+        targetDefinitionId: matchedTarget.id || 'TARGET_PROGRAMME',
+        targetKey: item.courseCode || matchedTarget.name || item.courseName,
         courseName: item.courseName,
+        courseCode: item.courseCode || '',
         declaredDate: item.declaredDate,
+        examSession: item.examSession || '',
         category: item.category,
         actionLink: item.actionLink,
         rawRowText: item.rawRowText
@@ -263,21 +360,31 @@ export function identifyTargetMatches(declaredResults, targets, targetSession = 
     }
   }
 
-  // Fallback scan: only triggers if table parsing found no rows, but raw page
-  // text still contains a line matching the target programme.
-  if (matches.length === 0 && fullPageText) {
-    const lines = fullPageText.split(/[\n\r]+|\s{2,}/);
+  // Fallback scan: ONLY triggers if table parsing found ZERO rows (e.g. portal layout changed).
+  // Never runs when the table parsed successfully (prevents false positives from other exam sessions).
+  if (declaredResults.length === 0 && matches.length === 0 && fullPageText) {
+    const lines = String(fullPageText).split(/[\n\r]+|\s{2,}/);
     for (const line of lines) {
-      if (line.length > 3 && isTargetProgramme(line, targets)) {
-        logger.warn(`Fallback content scan detected target programme: "${line}"`);
+      const trimmed = line.trim();
+      if (trimmed.length <= 3 || trimmed.length > 400) continue;
+
+      // Respect exam session filter during fallback scan as well
+      if (normalizedSession && !containsNormalizedBoundarySafe(normalizeProgrammeText(trimmed), normalizedSession)) {
+        continue;
+      }
+
+      const matchedTarget = findMatchingTarget(trimmed, targets);
+      if (matchedTarget) {
+        logger.warn(`Fallback content scan detected target programme: "${trimmed}"`);
         matches.push({
-          targetDefinitionId: targets[0]?.id || 'TARGET_PROGRAMME',
-          targetKey: targets[0]?.name || line.trim(),
-          courseName: line.trim(),
+          targetDefinitionId: matchedTarget.id || 'TARGET_PROGRAMME',
+          targetKey: matchedTarget.codes?.[0] || matchedTarget.name || trimmed,
+          courseName: trimmed,
           declaredDate: 'Recently Declared',
-          category: 'Declared Results',
+          examSession: targetSession ? targetSession.toUpperCase() : '',
+          category: targetSession ? `Exam Session ${targetSession.toUpperCase()}` : 'Declared Results',
           actionLink: '',
-          rawRowText: `Detected via fallback content scan: "${line.trim()}"`
+          rawRowText: `Detected via fallback content scan: "${trimmed}"`
         });
         break;
       }
@@ -296,10 +403,10 @@ export function identifyTargetMatches(declaredResults, targets, targetSession = 
 export async function checkVMOUResults(env = {}) {
   const startTime = Date.now();
   const baseUrl = (env.TARGET_URL || DEFAULT_TARGET_URL).replace(/\/+$/, '');
-  const targetSession = env.TARGET_SESSION != null ? String(env.TARGET_SESSION) : 'JUNE26';
+  const targetSession = env.TARGET_SESSION != null ? String(env.TARGET_SESSION).trim() : 'JUNE26';
   const targets = resolveTargetDefinitions(env);
 
-  logger.info(`Starting VMOU examination results check for session [${targetSession}]...`, {
+  logger.info(`Starting VMOU examination results check for session [${targetSession || 'ALL'}]...`, {
     targetUrl: baseUrl,
     targetProgrammes: targets.map(t => `${t.name} (${t.codes.join(', ')})`)
   });
@@ -338,8 +445,8 @@ export async function checkVMOUResults(env = {}) {
   const allDeclaredResults = parseDeclaredResultsTable(pageHtml);
   logger.info(`Found total ${allDeclaredResults.length} declared exam results on page.`);
 
-  const textContent = pageHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
-  const matchedTargets = identifyTargetMatches(allDeclaredResults, targets, targetSession, textContent);
+  const readableText = allDeclaredResults.length === 0 ? extractReadableText(pageHtml) : '';
+  const matchedTargets = identifyTargetMatches(allDeclaredResults, targets, targetSession, readableText);
 
   const durationMs = Date.now() - startTime;
   const now = new Date();
