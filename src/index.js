@@ -5,9 +5,10 @@
  * Architecture:
  * 1. Scheduled Event Handler (scheduled):
  *    - Triggered every 5 minutes by Cloudflare's Cron Triggers
+ *    - Respects CRON_PAUSED flag to exit cleanly without polling/KV writes
  *    - Executes check with automatic retry (max 3 attempts)
  *    - Persists execution state & timestamps to Cloudflare KV
- *    - Evaluates Dead Man's Switch (alerts if gap > 10 minutes)
+ *    - Evaluates Dead Man's Switch (alerts if gap > threshold)
  *    - Dispatches notifications via Email, Telegram, and Browser Web Push
  *
  * 2. Fetch Handler (fetch):
@@ -19,7 +20,7 @@
  *    - POST /api/push/subscribe         -> Register browser push subscription in KV
  *    - POST /api/push/unsubscribe       -> Remove browser push subscription from KV
  *    - POST /api/push/test              -> Send test push notification to devices
- *    - POST|GET /check-now              -> On-demand manual check trigger
+ *    - POST|GET /check-now              -> On-demand manual check trigger (?force=true)
  *    - POST|GET /test-notify            -> Test all notification channels with mock data
  * ==============================================================================
  */
@@ -29,6 +30,9 @@ import {
   getNowIso,
   formatIST,
   escapeHtml,
+  sanitizeHttpUrl,
+  parseSafeInt,
+  isCronPaused,
   withRetry,
   getState,
   updateState,
@@ -40,6 +44,7 @@ import {
   acquireDispatchLock,
   releaseDispatchLock,
   checkNotificationCooldown,
+  validatePushSubscription,
   getPushSubscriptions,
   savePushSubscription,
   removePushSubscription,
@@ -101,8 +106,8 @@ self.addEventListener('push', (event) => {
 
   const notificationOptions = {
     body: payload.body,
-    icon: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="%23134a5c"/><text x="50" y="65" font-size="50" text-anchor="middle" fill="%23ffffff">🎓</text></svg>',
-    badge: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="%23134a5c"/><text x="50" y="65" font-size="50" text-anchor="middle" fill="%23ffffff">🎓</text></svg>',
+    icon: '/favicon.svg',
+    badge: '/favicon.svg',
     tag: payload.tag || 'vmou-result-alert',
     renotify: true,
     requireInteraction: true,
@@ -124,18 +129,21 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  let targetUrl = 'https://online.vmou.ac.in/results.aspx';
-  if (event.action === 'open_dashboard') {
-    targetUrl = 'https://result-notifier.nvy.workers.dev/';
-  } else if (event.notification.data && event.notification.data.url) {
-    targetUrl = event.notification.data.url;
-  }
+  const dashboardUrl = self.location.origin + '/';
+  const isDashboardAction = event.action === 'open_dashboard';
+  const targetUrl = isDashboardAction
+    ? dashboardUrl
+    : ((event.notification.data && event.notification.data.url) || 'https://online.vmou.ac.in/results.aspx');
 
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      for (const client of clientList) {
-        if (client.url && client.url.includes('result-notifier') && 'focus' in client) {
-          return client.focus();
+      // Only reuse an existing dashboard window when explicitly opening the dashboard.
+      // Clicking the notification body or "Check Results" opens the VMOU results portal directly.
+      if (isDashboardAction) {
+        for (const client of clientList) {
+          if (client.url && client.url.startsWith(self.location.origin) && 'focus' in client) {
+            return client.focus();
+          }
         }
       }
       if (clients.openWindow) {
@@ -147,25 +155,52 @@ self.addEventListener('notificationclick', (event) => {
 `.trim();
 
 /**
+ * Build a mock check result payload reflecting the current Worker env configuration.
+ */
+function buildTestCheckResult(env = {}) {
+  const programmeCode = env.TARGET_PROGRAMME_CODE || 'MAPSN-2';
+  const programmeName = env.TARGET_PROGRAMME_NAME || 'M.A. POLITICAL SCIENCE (Semester-II)';
+  const targetSession = env.TARGET_SESSION || 'JUNE26';
+
+  return {
+    portalUrl: sanitizeHttpUrl(env.TARGET_URL),
+    checkTimestamp: getNowIso(),
+    checkTimestampIST: formatIST(new Date()),
+    matches: [
+      {
+        targetDefinitionId: 'MA_POLITICAL_SCIENCE_SEM2',
+        targetKey: programmeCode,
+        courseName: `${programmeName} Examination Result (TEST ALERT)`,
+        courseCode: programmeCode,
+        declaredDate: new Date().toLocaleDateString('en-GB'),
+        examSession: targetSession,
+        category: targetSession ? `Exam Session ${targetSession}` : 'Declared Results'
+      }
+    ]
+  };
+}
+
+/**
  * Execute a check run, evaluate state, and dispatch notifications if new results are declared.
  *
  * @param {Object} env Cloudflare Worker environment bindings
  * @param {Object} options Configuration flags
  * @param {boolean} options.forceNotification Force sending alerts even if already notified
- * @param {string} options.triggerSource "cron" | "manual"
+ * @param {string} options.triggerSource "cron" | "manual_http"
  * @returns {Promise<Object>} Execution result summary
  */
-async function runCheckPipeline(env, { triggerSource = 'cron' } = {}) {
+export async function runCheckPipeline(env, { forceNotification = false, triggerSource = 'cron' } = {}) {
   const runStartMs = Date.now();
   const kv = env.RESULTS_KV || null;
-  const maxRetries = parseInt(env.MAX_RETRIES || '3', 10);
-  const deadManThreshold = parseInt(env.DEAD_MAN_THRESHOLD_MINUTES || '10', 10);
+  const maxRetries = parseSafeInt(env.MAX_RETRIES, 3, { min: 0, max: 10 });
+  const deadManThreshold = parseSafeInt(env.DEAD_MAN_THRESHOLD_MINUTES, 10, { min: 1, max: 1440 });
+  const cronPaused = isCronPaused(env);
 
-  logger.info(`=== Starting check iteration [Trigger: ${triggerSource}] ===`);
+  logger.info(`=== Starting check iteration [Trigger: ${triggerSource}, Force: ${forceNotification}] ===`);
 
   // 1. Evaluate Dead Man's Switch from previous state
   const previousState = await getState(kv);
-  const deadManStatus = evaluateDeadManSwitch(previousState, deadManThreshold);
+  const deadManStatus = evaluateDeadManSwitch(previousState, deadManThreshold, { paused: cronPaused });
 
   if (deadManStatus.tripped) {
     logger.warn(`⚠️ [DEAD MAN'S SWITCH] ${deadManStatus.message}`);
@@ -207,14 +242,15 @@ async function runCheckPipeline(env, { triggerSource = 'cron' } = {}) {
   const currentState = await getState(kv);
 
   if (checkResult.hasMatches) {
-    const shouldAlert = shouldDispatchNotification(currentState, checkResult.matches);
+    const shouldAlert = forceNotification || shouldDispatchNotification(currentState, checkResult.matches);
 
     if (shouldAlert) {
       // Cooldown guard: prevent sending duplicate bursts (5 min minimum between alerts)
+      // Bypassed when forceNotification=true is explicitly requested.
       const cooldownMinutes = 5;
-      const cooldown = checkNotificationCooldown(currentState, cooldownMinutes);
+      const cooldown = checkNotificationCooldown(currentState, cooldownMinutes, 'lastNotificationTimestamp');
 
-      if (cooldown.inCooldown) {
+      if (!forceNotification && cooldown.inCooldown) {
         logger.warn(`⏳ [NOTIFICATION COOLDOWN] Alert suppressed: Sent ${cooldown.elapsedSeconds}s ago (Cooldown: ${cooldownMinutes * 60}s). Skipping duplicate.`);
       } else {
         // Concurrency lock: ensures only ONE worker instance across all Cloudflare PoPs dispatches the notification
@@ -224,16 +260,34 @@ async function runCheckPipeline(env, { triggerSource = 'cron' } = {}) {
           logger.warn(`🔒 [CONCURRENCY LOCK] Another worker instance is currently dispatching notifications. Skipping duplicate broadcast.`);
         } else {
           try {
-            logger.info(`🔔 New target exam results detected! Initiating multi-channel broadcast...`);
+            logger.info(`🔔 Target exam results detected! Initiating multi-channel broadcast...`);
 
-            // Mark in-flight in KV state BEFORE external API calls to immediately block any racing instances
-            await recordNotificationDispatched(kv, checkResult.matches, { status: 'in_progress', timestamp: getNowIso() });
-
-            // Broadcast alerts once across channels
+            // Broadcast alerts once across channels (protected by concurrency lock)
             notificationReport = await notifyAllChannels(env, checkResult);
 
-            // Record completed report
-            await recordNotificationDispatched(kv, checkResult.matches, notificationReport);
+            // Only mark the fingerprint as notified if at least one channel actually delivered.
+            // If all channels failed or had zero subscribers, keep the fingerprint unnotified
+            // so future checks can still alert once delivery succeeds.
+            if (notificationReport.anySucceeded) {
+              await recordNotificationDispatched(kv, checkResult.matches, notificationReport, {
+                markFingerprintNotified: true
+              });
+            } else {
+              logger.warn(`⚠️ No notification channels delivered successfully; fingerprint NOT marked as notified so alerts can retry.`);
+              await recordNotificationDispatched(kv, checkResult.matches, notificationReport, {
+                markFingerprintNotified: false
+              });
+            }
+          } catch (notifyErr) {
+            logger.error(`Notification broadcast threw an unexpected error: ${notifyErr.message}`);
+            notificationReport = {
+              anySucceeded: false,
+              allSucceeded: false,
+              error: notifyErr.message
+            };
+            await recordNotificationDispatched(kv, checkResult.matches, notificationReport, {
+              markFingerprintNotified: false
+            });
           } finally {
             await releaseDispatchLock(kv);
           }
@@ -243,7 +297,9 @@ async function runCheckPipeline(env, { triggerSource = 'cron' } = {}) {
       logger.info(`ℹ️ Target results are active on portal, but alert was previously dispatched. Skipping duplicate notification.`);
     }
   } else {
-    logger.info(`Checked ${checkResult.totalDeclaredOnPage} declared results. No target programme (M.A. Political Science Sem-II / MAPSN-2) detected yet.`);
+    const targetName = env.TARGET_PROGRAMME_NAME || 'M.A. Political Science Sem-II';
+    const targetCode = env.TARGET_PROGRAMME_CODE || 'MAPSN-2';
+    logger.info(`Checked ${checkResult.totalDeclaredOnPage} declared results. No target programme (${targetName} / ${targetCode}) detected yet.`);
   }
 
   const totalDurationMs = Date.now() - runStartMs;
@@ -251,6 +307,7 @@ async function runCheckPipeline(env, { triggerSource = 'cron' } = {}) {
   return {
     success: true,
     triggerSource,
+    forceNotification,
     durationMs: totalDurationMs,
     timestamp: getNowIso(),
     timestampIST: formatIST(new Date()),
@@ -276,7 +333,7 @@ export default {
     // Monitoring PAUSED via CRON_PAUSED (wrangler.toml [vars]): exit before
     // doing any work. The trigger still fires, but no portal checks,
     // notifications or KV writes happen. Set CRON_PAUSED = "false" to resume.
-    if ((env.CRON_PAUSED || '').trim().toLowerCase() === 'true') {
+    if (isCronPaused(env)) {
       logger.info(`[Scheduled Event] Cron "${cronExpression}" fired but monitoring is PAUSED (CRON_PAUSED=true) - skipping`);
       return;
     }
@@ -303,6 +360,7 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const kv = env.RESULTS_KV || null;
+    const cronPaused = isCronPaused(env);
 
     // CORS Headers for API consumers
     const corsHeaders = {
@@ -322,13 +380,26 @@ export default {
       // ------------------------------------------------------------------------
       if (path === '/health') {
         const state = await getState(kv);
-        const deadManThreshold = parseInt(env.DEAD_MAN_THRESHOLD_MINUTES || '10', 10);
-        const deadMan = evaluateDeadManSwitch(state, deadManThreshold);
+        const deadManThreshold = parseSafeInt(env.DEAD_MAN_THRESHOLD_MINUTES, 10, { min: 1, max: 1440 });
+        const deadMan = evaluateDeadManSwitch(state, deadManThreshold, { paused: cronPaused });
 
-        const isHealthy = state.lastCheckStatus !== 'error' && !deadMan.tripped;
+        let healthStatus = 'healthy';
+        let httpStatus = 200;
+
+        if (cronPaused) {
+          healthStatus = 'paused';
+          httpStatus = 200;
+        } else if (state.lastCheckStatus === 'error') {
+          healthStatus = 'unhealthy';
+          httpStatus = 503;
+        } else if (deadMan.tripped) {
+          healthStatus = 'degraded_dead_man';
+          httpStatus = 503;
+        }
 
         const body = {
-          status: isHealthy ? 'healthy' : (deadMan.tripped ? 'degraded_dead_man' : 'unhealthy'),
+          status: healthStatus,
+          cronPaused,
           service: 'vmou-result-notifier',
           version: '1.1.0',
           currentTimestamp: getNowIso(),
@@ -345,7 +416,7 @@ export default {
         };
 
         return new Response(JSON.stringify(body, null, 2), {
-          status: isHealthy ? 200 : 503,
+          status: httpStatus,
           headers: corsHeaders
         });
       }
@@ -380,8 +451,9 @@ export default {
       // ------------------------------------------------------------------------
       if (path === '/api/push/subscribe' && request.method === 'POST') {
         const payload = await request.json().catch(() => null);
-        if (!payload || !payload.subscription || !payload.subscription.endpoint) {
-          return new Response(JSON.stringify({ error: 'Invalid push subscription payload' }), {
+        const validation = validatePushSubscription(payload?.subscription);
+        if (!validation.valid) {
+          return new Response(JSON.stringify({ error: validation.error || 'Invalid push subscription payload' }), {
             status: 400,
             headers: corsHeaders
           });
@@ -404,7 +476,7 @@ export default {
       // ------------------------------------------------------------------------
       if (path === '/api/push/unsubscribe' && request.method === 'POST') {
         const payload = await request.json().catch(() => null);
-        if (!payload || !payload.endpoint) {
+        if (!payload || typeof payload.endpoint !== 'string' || !payload.endpoint.trim()) {
           return new Response(JSON.stringify({ error: 'Missing subscription endpoint' }), {
             status: 400,
             headers: corsHeaders
@@ -414,6 +486,7 @@ export default {
         return new Response(JSON.stringify({
           success: true,
           message: 'Device unsubscribed from browser push notifications',
+          removed: unsubResult.removed,
           remainingSubscribers: unsubResult.count
         }, null, 2), {
           status: 200,
@@ -426,32 +499,19 @@ export default {
       // ------------------------------------------------------------------------
       if (path === '/api/push/test') {
         logger.info('Test push notification requested via HTTP');
-        const mockCheckResult = {
-          portalUrl: env.TARGET_URL || 'https://online.vmou.ac.in/results.aspx',
-          checkTimestamp: getNowIso(),
-          checkTimestampIST: formatIST(new Date()),
-          matches: [
-            {
-              targetDefinitionId: 'MA_POLITICAL_SCIENCE_SEM2',
-              targetKey: 'M.A. POLITICAL SCIENCE (Semester-II)',
-              courseName: 'M.A. POLITICAL SCIENCE (Semester-II) Examination Result (TEST ALERT)',
-              declaredDate: new Date().toLocaleDateString('en-GB'),
-              category: 'Exam Session JUNE26'
-            }
-          ]
-        };
-
+        const mockCheckResult = buildTestCheckResult(env);
         const pushReport = await sendWebPush(env, mockCheckResult);
 
         return new Response(JSON.stringify({
+          success: pushReport.success && !pushReport.skipped,
           message: pushReport.delivered > 0
             ? 'Test push notification delivered to active devices!'
             : (pushReport.subscribers === 0
                 ? 'No active browser subscriptions registered yet. Click "Turn on Push Notifications" on the dashboard first!'
-                : 'Test push attempt completed.'),
+                : (pushReport.error || 'Test push attempt failed to deliver.')),
           report: pushReport
         }, null, 2), {
-          status: pushReport.success ? 200 : 500,
+          status: pushReport.success ? 200 : 502,
           headers: corsHeaders
         });
       }
@@ -462,8 +522,9 @@ export default {
       if (path === '/status') {
         const state = await getState(kv);
         const pushSubs = await getPushSubscriptions(kv);
-        const deadManThreshold = parseInt(env.DEAD_MAN_THRESHOLD_MINUTES || '10', 10);
-        const deadMan = evaluateDeadManSwitch(state, deadManThreshold);
+        const deadManThreshold = parseSafeInt(env.DEAD_MAN_THRESHOLD_MINUTES, 10, { min: 1, max: 1440 });
+        const checkIntervalMinutes = parseSafeInt(env.CHECK_INTERVAL_MINUTES, 5, { min: 1, max: 1440 });
+        const deadMan = evaluateDeadManSwitch(state, deadManThreshold, { paused: cronPaused });
 
         // Email & Telegram are TEMPORARILY DISABLED via ENABLE_EMAIL/ENABLE_TELEGRAM vars
         const emailChannelActive = String(env.ENABLE_EMAIL || 'false').trim().toLowerCase() === 'true';
@@ -478,11 +539,12 @@ export default {
         const body = {
           service: 'vmou-result-notifier',
           environment: {
-            targetUrl: env.TARGET_URL || 'https://online.vmou.ac.in/results.aspx',
+            cronPaused,
+            targetUrl: sanitizeHttpUrl(env.TARGET_URL),
             targetSession: env.TARGET_SESSION || 'JUNE26',
             targetProgrammeCode: env.TARGET_PROGRAMME_CODE || 'MAPSN-2',
             targetProgrammeName: env.TARGET_PROGRAMME_NAME || 'M.A. POLITICAL SCIENCE (Semester-II)',
-            checkIntervalMinutes: env.CHECK_INTERVAL_MINUTES || '5',
+            checkIntervalMinutes: String(checkIntervalMinutes),
             deadManThresholdMinutes: deadManThreshold,
             channelsConfigured: channelConfig,
             webPushSubscribersCount: pushSubs.length
@@ -506,9 +568,11 @@ export default {
       // Query param ?force=true forces notifications to be sent
       // ------------------------------------------------------------------------
       if (path === '/check-now') {
-        logger.info('Manual check requested via HTTP');
+        const forceNotification = url.searchParams.get('force') === 'true';
+        logger.info(`Manual check requested via HTTP (force=${forceNotification})`);
 
         const result = await runCheckPipeline(env, {
+          forceNotification,
           triggerSource: 'manual_http'
         });
 
@@ -520,20 +584,20 @@ export default {
 
       // ------------------------------------------------------------------------
       // POST | GET /test-notify - Test notification channels with mock data
-      // Protected by 60s cooldown and distributed lock to prevent multi-message bursts
+      // Protected by 60s test cooldown (isolated from real result alerts) and lock
       // ------------------------------------------------------------------------
       if (path === '/test-notify') {
         logger.info(`Test notification requested via HTTP`);
 
         const state = await getState(kv);
-        // Strict 60s cooldown on test alerts to avoid spamming
-        const cooldown = checkNotificationCooldown(state, 1);
+        // Strict 60s cooldown on test alerts only (separate from real alert cooldown)
+        const cooldown = checkNotificationCooldown(state, 1, 'lastTestNotificationTimestamp');
         if (cooldown.inCooldown) {
           logger.warn(`Test notification rate-limited: Dispatched ${cooldown.elapsedSeconds}s ago (Cooldown: 60s)`);
           return new Response(JSON.stringify({
             success: false,
             rateLimited: true,
-            message: `Rate limited: A notification was already sent ${cooldown.elapsedSeconds}s ago. Please wait ${cooldown.remainingSeconds}s before sending another test alert.`,
+            message: `Rate limited: A test notification was already sent ${cooldown.elapsedSeconds}s ago. Please wait ${cooldown.remainingSeconds}s before sending another test alert.`,
             remainingSeconds: cooldown.remainingSeconds
           }, null, 2), {
             status: 429,
@@ -553,42 +617,37 @@ export default {
         }
 
         try {
-          const mockCheckResult = {
-            portalUrl: env.TARGET_URL || 'https://online.vmou.ac.in/results.aspx',
-            checkTimestamp: getNowIso(),
-            checkTimestampIST: formatIST(new Date()),
-            matches: [
-              {
-                targetDefinitionId: 'MA_POLITICAL_SCIENCE_SEM2',
-                targetKey: 'M.A. POLITICAL SCIENCE (Semester-II)',
-                courseName: 'M.A. POLITICAL SCIENCE (Semester-II) Examination Result (TEST ALERT)',
-                declaredDate: new Date().toLocaleDateString('en-GB'),
-                category: 'Exam Session JUNE26'
-              }
-            ]
-          };
-
+          const mockCheckResult = buildTestCheckResult(env);
           const notifyReport = await notifyAllChannels(env, mockCheckResult);
 
-          // Record test notification timestamp to track cooldown
-          await updateState(kv, {
-            lastNotificationTimestamp: getNowIso(),
-            lastNotificationTimestampIST: formatIST(new Date()),
-            lastNotificationStatus: notifyReport
-          });
+          // Only record test cooldown when at least one channel actually delivered,
+          // so failed/unsubscribed test attempts do not trigger a 60s lockout.
+          if (notifyReport.anySucceeded) {
+            await updateState(kv, {
+              lastTestNotificationTimestamp: getNowIso(),
+              lastNotificationStatus: notifyReport
+            });
+          } else {
+            await updateState(kv, {
+              lastNotificationStatus: notifyReport
+            });
+          }
 
+          const allSkipped = (notifyReport.skippedChannels?.length || 0) === 3;
           const responseMessage = notifyReport.anySucceeded
             ? 'Test notification triggered across all configured channels'
-            : (notifyReport.skippedChannels?.length === 3
+            : (allSkipped
                 ? 'No notification channels dispatched: only Browser Web Push is active (Email & Telegram are disabled by configuration) and no devices are subscribed yet. Enable Browser Push on the dashboard first.'
                 : 'Test notification dispatch failed on all channels (see report)');
+
+          const statusCode = notifyReport.anySucceeded ? 200 : (allSkipped ? 400 : 502);
 
           return new Response(JSON.stringify({
             success: notifyReport.anySucceeded,
             message: responseMessage,
             report: notifyReport
           }, null, 2), {
-            status: notifyReport.anySucceeded ? 200 : 500,
+            status: statusCode,
             headers: corsHeaders
           });
         } finally {
@@ -616,8 +675,9 @@ export default {
       if (path === '/') {
         const state = await getState(kv);
         const pushSubs = await getPushSubscriptions(kv);
-        const deadManThreshold = parseInt(env.DEAD_MAN_THRESHOLD_MINUTES || '10', 10);
-        const deadMan = evaluateDeadManSwitch(state, deadManThreshold);
+        const deadManThreshold = parseSafeInt(env.DEAD_MAN_THRESHOLD_MINUTES, 10, { min: 1, max: 1440 });
+        const checkIntervalMinutes = parseSafeInt(env.CHECK_INTERVAL_MINUTES, 5, { min: 1, max: 1440 });
+        const deadMan = evaluateDeadManSwitch(state, deadManThreshold, { paused: cronPaused });
 
         // Email & Telegram are TEMPORARILY DISABLED via ENABLE_EMAIL/ENABLE_TELEGRAM vars
         const emailEnabled = String(env.ENABLE_EMAIL || 'false').trim().toLowerCase() === 'true';
@@ -629,6 +689,12 @@ export default {
         const html = renderDashboardHtml({
           state,
           deadMan,
+          cronPaused,
+          targetUrl: sanitizeHttpUrl(env.TARGET_URL),
+          targetProgrammeName: env.TARGET_PROGRAMME_NAME || 'M.A. POLITICAL SCIENCE (Semester-II)',
+          targetProgrammeCode: env.TARGET_PROGRAMME_CODE || 'MAPSN-2',
+          targetSession: env.TARGET_SESSION || 'JUNE26',
+          checkIntervalMinutes,
           emailEnabled,
           telegramEnabled,
           emailOk,
@@ -670,22 +736,85 @@ export default {
 /**
  * Render Modern HTML Monitoring Dashboard
  */
-function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEnabled = false, emailOk = false, telegramOk = false, pushSubscriberCount = 0, vapidPublicKey = '' }) {
-  const isHealthy = state.lastCheckStatus === 'success' && !deadMan.tripped;
-  const statusBadge = isHealthy
-    ? `<span style="background: #10b981; color: #fff; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;">● OPERATIONAL</span>`
-    : `<span style="background: #ef4444; color: #fff; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;">● ALERT / DEGRADED</span>`;
+export function renderDashboardHtml({
+  state,
+  deadMan,
+  cronPaused = false,
+  targetUrl = 'https://online.vmou.ac.in/results.aspx',
+  targetProgrammeName = 'M.A. POLITICAL SCIENCE (Semester-II)',
+  targetProgrammeCode = 'MAPSN-2',
+  targetSession = 'JUNE26',
+  checkIntervalMinutes = 5,
+  emailEnabled = false,
+  telegramEnabled = false,
+  emailOk = false,
+  telegramOk = false,
+  pushSubscriberCount = 0,
+  vapidPublicKey = ''
+}) {
+  const safePortalUrl = sanitizeHttpUrl(targetUrl);
+  const thresholdMin = deadMan?.thresholdMinutes ?? 10;
+  const serverTimeIST = formatIST(new Date());
+
+  let statusBadge;
+  if (cronPaused) {
+    statusBadge = `<span style="background: #b45309; color: #fef3c7; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;">⏸ PAUSED</span>`;
+  } else if (state.lastCheckStatus === 'error' || deadMan.tripped) {
+    statusBadge = `<span style="background: #ef4444; color: #fff; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;">● ALERT / DEGRADED</span>`;
+  } else if (state.lastCheckStatus === 'never_run') {
+    statusBadge = `<span style="background: #334155; color: #cbd5e1; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;">○ WAITING FOR CHECK</span>`;
+  } else {
+    statusBadge = `<span style="background: #10b981; color: #fff; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 13px;">● OPERATIONAL</span>`;
+  }
+
+  let deadManColor = '#34d399';
+  let deadManLabel = '✓ Operational';
+  let deadManSubtext = `Elapsed: ${deadMan.elapsedMinutes} mins (Threshold: ${thresholdMin}m)`;
+
+  if (cronPaused) {
+    deadManColor = '#fbbf24';
+    deadManLabel = '⏸ Paused';
+    deadManSubtext = `Cron disabled (Threshold: ${thresholdMin}m)`;
+  } else if (deadMan.tripped) {
+    deadManColor = '#f87171';
+    deadManLabel = `⚠️ TRIPPED (> ${thresholdMin}m)`;
+  } else if (state.lastCheckStatus === 'never_run') {
+    deadManColor = '#94a3b8';
+    deadManLabel = '○ Pending First Run';
+    deadManSubtext = `Threshold: ${thresholdMin}m`;
+  }
+
+  const lastErrorNotice = state.lastError
+    ? `<div class="error-banner">
+        <strong>Last Check Error:</strong>
+        <span class="selectable" data-copyable="true">${escapeHtml(state.lastError)}</span>
+      </div>`
+    : '';
+
+  const emptyResultsText = cronPaused
+    ? 'No target programme results detected yet. Scheduled monitoring is paused — use Manual Check below to poll on demand.'
+    : `No target programme results detected yet. Monitoring every ${checkIntervalMinutes} minute${checkIntervalMinutes === 1 ? '' : 's'}...`;
 
   const resultsList = (state.detectedResults || []).length > 0
     ? state.detectedResults.map(r => `
-      <div style="background: #f0fdf4; border: 1px solid #bbf7d0; padding: 14px; border-radius: 8px; margin-bottom: 10px;">
-        <strong style="color: #166534; font-size: 15px;">🎉 ${escapeHtml(r.courseName)}</strong>
-        <div style="font-size: 13px; color: #374151; margin-top: 4px;">
-          📅 Declared: <strong>${escapeHtml(r.declaredDate || 'N/A')}</strong> | 📂 Category: ${escapeHtml(r.category || 'N/A')}
+      <div class="result-item">
+        <div class="result-title">
+          <span aria-hidden="true">🎉</span>
+          <strong class="selectable" data-copyable="true">${escapeHtml(r.courseName)}</strong>
+        </div>
+        <div class="result-meta">
+          <span>📅 Declared: <strong class="selectable" data-copyable="true">${escapeHtml(r.declaredDate || 'N/A')}</strong></span>
+          <span>|</span>
+          <span>📂 Category: <span class="selectable" data-copyable="true">${escapeHtml(r.category || 'N/A')}</span></span>
+          ${r.courseCode ? `<span>|</span><span>🏷️ Code: <span class="selectable" data-copyable="true">${escapeHtml(r.courseCode)}</span></span>` : ''}
         </div>
       </div>
     `).join('')
-    : `<div style="color: #6b7280; font-style: italic; padding: 16px; background: #f9fafb; border-radius: 8px; text-align: center;">No target programme results detected yet. Monitoring every 5 minutes...</div>`;
+    : `<div class="empty-results">${escapeHtml(emptyResultsText)}</div>`;
+
+  const lastCheckValueHtml = state.lastCheckTimestampIST
+    ? `<span class="selectable" data-copyable="true">${escapeHtml(state.lastCheckTimestampIST)}</span>`
+    : `<span>Never Run</span>`;
 
   return `
 <!DOCTYPE html>
@@ -707,6 +836,16 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       --primary: #38bdf8;
       --success: #34d399;
     }
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+    html, body {
+      user-select: none;
+      -webkit-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      -webkit-touch-callout: none;
+    }
     body {
       margin: 0;
       padding: 24px;
@@ -715,10 +854,17 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
       line-height: 1.5;
     }
-    @media (hover: none) and (pointer: coarse) {
-      body {
-        -webkit-touch-callout: none; /* disable long-press callout on iOS */
-      }
+    /* Only explicitly copyable data elements are selectable */
+    .selectable, .selectable * {
+      user-select: text;
+      -webkit-user-select: text;
+      -moz-user-select: text;
+      -ms-user-select: text;
+      -webkit-touch-callout: default;
+      cursor: text;
+    }
+    a.selectable {
+      cursor: pointer;
     }
     .container {
       max-width: 900px;
@@ -776,6 +922,53 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
     }
     .badge-on { background: #065f46; color: #6ee7b7; }
     .badge-off { background: #451a03; color: #fdba74; }
+    .result-item {
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(52, 211, 153, 0.35);
+      padding: 14px 16px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+    .result-item:last-child {
+      margin-bottom: 0;
+    }
+    .result-title {
+      color: #6ee7b7;
+      font-size: 15px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .result-meta {
+      font-size: 13px;
+      color: #cbd5e1;
+      margin-top: 6px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .empty-results {
+      color: var(--text-muted);
+      font-style: italic;
+      padding: 16px;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      text-align: center;
+      font-size: 14px;
+    }
+    .error-banner {
+      margin-bottom: 20px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      background: rgba(127, 29, 29, 0.45);
+      border: 1px solid rgba(248, 113, 113, 0.4);
+      color: #fecaca;
+      font-size: 13px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
     .btn {
       display: inline-block;
       background: #0284c7;
@@ -787,14 +980,15 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       font-size: 14px;
       cursor: pointer;
       border: none;
-      transition: background 0.2s;
+      transition: background 0.2s, opacity 0.2s;
     }
-    .btn:hover { background: #0369a1; }
+    .btn:hover:not(:disabled) { background: #0369a1; }
+    .btn:disabled { opacity: 0.65; cursor: not-allowed; }
     .btn-secondary {
       background: #334155;
       color: #e2e8f0;
     }
-    .btn-secondary:hover { background: #475569; }
+    .btn-secondary:hover:not(:disabled) { background: #475569; }
     .actions {
       display: flex;
       gap: 12px;
@@ -808,6 +1002,9 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       font-size: 13px;
       color: var(--text-muted);
       text-align: center;
+    }
+    @media (max-width: 600px) {
+      body { padding: 16px; }
     }
   </style>
 </head>
@@ -828,11 +1025,13 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       <div>${statusBadge}</div>
     </div>
 
+    ${lastErrorNotice}
+
     <div class="grid">
       <div class="card">
         <div class="card-title">Last Check Time</div>
         <div class="card-value" style="font-size: 16px;">
-          ${escapeHtml(state.lastCheckTimestampIST || 'Never Run')}
+          ${lastCheckValueHtml}
         </div>
         <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
           Duration: ${state.lastDurationMs || 0}ms | Total Runs: ${state.totalChecks || 0}
@@ -841,22 +1040,25 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
 
       <div class="card">
         <div class="card-title">Dead Man's Switch</div>
-        <div class="card-value" style="font-size: 16px; color: ${deadMan.tripped ? '#f87171' : '#34d399'};">
-          ${deadMan.tripped ? '⚠️ TRIPPED (> 10m)' : '✓ Operational'}
+        <div class="card-value" style="font-size: 16px; color: ${deadManColor};">
+          ${deadManLabel}
         </div>
         <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
-          Elapsed: ${deadMan.elapsedMinutes} mins (Threshold: 10m)
+          ${escapeHtml(deadManSubtext)}
         </div>
       </div>
 
       <div class="card">
         <div class="card-title">Target Programmes Monitored</div>
         <div class="card-value" style="font-size: 15px;">
-          M.A. POLITICAL SCIENCE (Semester-II)<br>
-          <span style="font-size: 13px; color: var(--text-muted);">Programme Code: MAPSN-2 &middot; Session: JUNE26</span>
+          <span class="selectable" data-copyable="true">${escapeHtml(targetProgrammeName)}</span>
+          <div style="font-size: 13px; color: var(--text-muted); font-weight: 500; margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px 12px;">
+            <span style="white-space: nowrap;">Programme Code: <span class="selectable" data-copyable="true" style="color: #e2e8f0; font-weight: 600;">${escapeHtml(targetProgrammeCode)}</span></span>
+            <span style="white-space: nowrap;">Session: <span class="selectable" data-copyable="true" style="color: #e2e8f0; font-weight: 600;">${escapeHtml(targetSession)}</span></span>
+          </div>
         </div>
-        <div style="font-size: 12px; color: var(--text-muted); margin-top: 6px;">
-          Interval: Every 5 minutes (Cron Trigger)
+        <div style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
+          ${cronPaused ? 'Schedule: Paused (CRON_PAUSED=true)' : `Interval: Every ${checkIntervalMinutes} minute${checkIntervalMinutes === 1 ? '' : 's'} (Cron Trigger)`}
         </div>
       </div>
     </div>
@@ -870,7 +1072,7 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
         <span class="channel-badge ${telegramOk ? 'badge-on' : 'badge-off'}">
           ${telegramOk ? '✓' : '&#10007;'} Telegram Bot${telegramEnabled ? '' : ' (disabled)'}
         </span>
-        <span class="channel-badge badge-on">
+        <span id="channel-push-badge" class="channel-badge badge-on">
           ✓ Browser Web Push (${pushSubscriberCount} device${pushSubscriberCount === 1 ? '' : 's'})
         </span>
       </div>
@@ -896,18 +1098,18 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       </div>
 
       <div style="margin-top: 18px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
-        <button id="btn-subscribe-push" class="btn" style="background: #0284c7;" onclick="handlePushSubscribeClick()">
+        <button id="btn-subscribe-push" type="button" class="btn" style="background: #0284c7;" onclick="handlePushSubscribeClick()">
           🔔 Turn on Push Notifications
         </button>
-        <button id="btn-test-push" class="btn btn-secondary" style="display: none;" onclick="handleSendTestPush()">
+        <button id="btn-test-push" type="button" class="btn btn-secondary" style="display: none;" onclick="handleSendTestPush()">
           🧪 Send Test Push to this Device
         </button>
-        <button id="btn-unsubscribe-push" class="btn btn-secondary" style="display: none; font-size: 12px; padding: 6px 12px; background: transparent; border: 1px solid #475569;" onclick="handlePushUnsubscribeClick()">
+        <button id="btn-unsubscribe-push" type="button" class="btn btn-secondary" style="display: none; font-size: 12px; padding: 6px 12px; background: transparent; border: 1px solid #475569;" onclick="handlePushUnsubscribeClick()">
           Disable on this Device
         </button>
       </div>
 
-      <div id="push-msg" style="margin-top: 12px; font-size: 13px; display: none;"></div>
+      <div id="push-msg" class="selectable" data-copyable="true" style="margin-top: 12px; font-size: 13px; display: none;"></div>
 
       <div style="margin-top: 14px; padding-top: 12px; border-top: 1px solid #334155; font-size: 12px; color: #64748b; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
         <span>Active Subscribed Devices: <strong id="sub-count-display" style="color: #94a3b8;">${pushSubscriberCount}</strong></span>
@@ -921,29 +1123,58 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
     </div>
 
     <div class="card">
-      <div class="card-title">Quick Actions & Diagnostic Tools</div>
+      <div class="card-title">Quick Actions &amp; Diagnostic Tools</div>
       <div class="actions">
-        <button id="btn-manual-check" class="btn" onclick="handleManualCheck()">⚡ Run Manual Check Now</button>
-        <button id="btn-test-all" class="btn btn-secondary" onclick="handleTestAllChannels()">🧪 Test All Notification Channels</button>
-        <a class="btn btn-secondary" href="/status" target="_blank">📊 Raw JSON Telemetry</a>
+        <button id="btn-manual-check" type="button" class="btn" onclick="handleManualCheck()">⚡ Run Manual Check Now</button>
+        <button id="btn-test-all" type="button" class="btn btn-secondary" onclick="handleTestAllChannels()">🧪 Test All Notification Channels</button>
+        <a class="btn btn-secondary" href="/status" target="_blank" rel="noopener noreferrer">📊 Raw JSON Telemetry</a>
       </div>
-      <div id="action-feedback" style="display: none; margin-top: 14px; padding: 12px 16px; border-radius: 8px; font-size: 13px;"></div>
+      <div id="action-feedback" class="selectable" data-copyable="true" style="display: none; margin-top: 14px; padding: 12px 16px; border-radius: 8px; font-size: 13px;"></div>
     </div>
 
     <footer>
-      Running on Cloudflare Global Edge Network • Server Time: ${formatIST(new Date())}
-      <br>Target Portal: <a href="https://online.vmou.ac.in/results.aspx" target="_blank" style="color: var(--primary);">https://online.vmou.ac.in/results.aspx</a>
+      Running on Cloudflare Global Edge Network &bull; Server Time: <span class="selectable" data-copyable="true">${escapeHtml(serverTimeIST)}</span>
+      <br>Target Portal: <a class="selectable" data-copyable="true" href="${escapeHtml(safePortalUrl)}" target="_blank" rel="noopener noreferrer" style="color: var(--primary);">${escapeHtml(safePortalUrl)}</a>
     </footer>
   </div>
 
   <script>
     const VAPID_PUBLIC_KEY = '${escapeHtml(vapidPublicKey)}';
 
-    // Disable right-click / long-press context menu on mobile phones only
+    function isCopyableTarget(target) {
+      const el = target && target.nodeType === 3 ? target.parentElement : target;
+      return Boolean(el && typeof el.closest === 'function' && el.closest('.selectable, input, textarea'));
+    }
+
+    // Prevent starting text selection outside explicitly copyable elements
+    document.addEventListener('selectstart', (e) => {
+      if (!isCopyableTarget(e.target)) {
+        e.preventDefault();
+      }
+    });
+
+    // Disable right-click / long-press context menu on mobile devices for non-copyable UI,
+    // while keeping copyable elements selectable and copyable via long-press.
     const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
       || (navigator.maxTouchPoints > 1 && window.matchMedia('(hover: none) and (pointer: coarse)').matches);
     if (isMobile) {
-      document.addEventListener('contextmenu', (e) => e.preventDefault());
+      document.addEventListener('contextmenu', (e) => {
+        if (!isCopyableTarget(e.target)) {
+          e.preventDefault();
+        }
+      });
+    }
+
+    function updateSubscriberCountUI(count) {
+      if (typeof count !== 'number' || Number.isNaN(count)) return;
+      const countEl = document.getElementById('sub-count-display');
+      if (countEl) {
+        countEl.innerText = String(count);
+      }
+      const badgeEl = document.getElementById('channel-push-badge');
+      if (badgeEl) {
+        badgeEl.innerText = '✓ Browser Web Push (' + count + ' device' + (count === 1 ? '' : 's') + ')';
+      }
     }
 
     function urlBase64ToUint8Array(base64String) {
@@ -964,7 +1195,7 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       const btnUnsub = document.getElementById('btn-unsubscribe-push');
       const msg = document.getElementById('push-msg');
 
-      if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
         if (pill) pill.innerHTML = '<span style="background: #451a03; color: #fdba74; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 12px;">Push Not Supported</span>';
         if (btnSubscribe) {
           btnSubscribe.disabled = true;
@@ -980,6 +1211,7 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
         if (Notification.permission === 'denied') {
           if (pill) pill.innerHTML = '<span style="background: #450a0a; color: #fca5a5; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 12px;">🚫 Blocked in Browser</span>';
           if (btnSubscribe) {
+            btnSubscribe.style.display = 'inline-block';
             btnSubscribe.disabled = true;
             btnSubscribe.innerText = 'Notifications Blocked in Settings';
           }
@@ -1010,6 +1242,11 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
         }
       } catch (err) {
         console.error('Error checking push status:', err);
+        if (pill) pill.innerHTML = '<span style="background: #451a03; color: #fdba74; padding: 4px 12px; border-radius: 9999px; font-weight: 600; font-size: 12px;">⚠️ Unavailable</span>';
+        if (btnSubscribe) {
+          btnSubscribe.disabled = false;
+          btnSubscribe.innerText = '🔔 Turn on Push Notifications';
+        }
       }
     }
 
@@ -1030,7 +1267,7 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
             msg.style.color = '#fca5a5';
             msg.innerText = 'Notification permission was not granted (' + perm + '). Click again or check browser settings.';
           }
-          checkPushStatus();
+          await checkPushStatus();
           return;
         }
 
@@ -1047,10 +1284,11 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
           });
         }
 
+        const serializedSub = typeof sub.toJSON === 'function' ? sub.toJSON() : sub;
         const res = await fetch('/api/push/subscribe', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ subscription: sub })
+          body: JSON.stringify({ subscription: serializedSub })
         });
 
         const data = await res.json();
@@ -1060,10 +1298,7 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
             msg.style.color = '#34d399';
             msg.innerText = '🎉 Device successfully subscribed! You will receive instant notifications when results are declared.';
           }
-          const countEl = document.getElementById('sub-count-display');
-          if (countEl && data.totalSubscribers) {
-            countEl.innerText = data.totalSubscribers;
-          }
+          updateSubscriberCountUI(data.totalSubscribers);
         } else {
           throw new Error(data.error || 'Server rejected subscription');
         }
@@ -1082,17 +1317,27 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
     }
 
     async function handlePushUnsubscribeClick() {
+      const btnUnsub = document.getElementById('btn-unsubscribe-push');
       const msg = document.getElementById('push-msg');
+      if (btnUnsub) {
+        btnUnsub.disabled = true;
+        btnUnsub.innerText = 'Disabling...';
+      }
       try {
         const reg = await navigator.serviceWorker.ready;
         const sub = await reg.pushManager.getSubscription();
         if (sub) {
-          await fetch('/api/push/unsubscribe', {
+          const res = await fetch('/api/push/unsubscribe', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ endpoint: sub.endpoint })
           });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            throw new Error(data.error || 'Failed to remove subscription from server');
+          }
           await sub.unsubscribe();
+          updateSubscriberCountUI(data.remainingSubscribers);
         }
         if (msg) {
           msg.style.display = 'block';
@@ -1102,6 +1347,16 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
         await checkPushStatus();
       } catch (err) {
         console.error(err);
+        if (msg) {
+          msg.style.display = 'block';
+          msg.style.color = '#f87171';
+          msg.innerText = 'Failed to disable notifications: ' + err.message;
+        }
+      } finally {
+        if (btnUnsub) {
+          btnUnsub.disabled = false;
+          btnUnsub.innerText = 'Disable on this Device';
+        }
       }
     }
 
@@ -1113,26 +1368,28 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       try {
         const res = await fetch('/api/push/test', { method: 'POST' });
         const data = await res.json();
-        btnTest.disabled = false;
-        btnTest.innerText = '🧪 Send Test Push to this Device';
         if (msg) {
           msg.style.display = 'block';
           if (res.ok && data.report?.delivered > 0) {
             msg.style.color = '#34d399';
             msg.innerText = '✅ Test notification sent! Check your device notification tray.';
+          } else if (!res.ok) {
+            msg.style.color = '#f87171';
+            msg.innerText = '✗ ' + (data.message || data.error || 'Failed to send test push.');
           } else {
             msg.style.color = '#38bdf8';
             msg.innerText = data.message || 'Test triggered.';
           }
         }
       } catch (err) {
-        btnTest.disabled = false;
-        btnTest.innerText = '🧪 Send Test Push to this Device';
         if (msg) {
           msg.style.display = 'block';
           msg.style.color = '#f87171';
           msg.innerText = 'Error sending test push: ' + err.message;
         }
+      } finally {
+        btnTest.disabled = false;
+        btnTest.innerText = '🧪 Send Test Push to this Device';
       }
     }
 
@@ -1181,6 +1438,12 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
       btn.innerText = '⏳ Dispatching test alerts...';
       if (fb) fb.style.display = 'none';
 
+      const channelLabels = {
+        email: 'Email',
+        telegram: 'Telegram',
+        webpush: 'Browser Web Push'
+      };
+
       try {
         const res = await fetch('/test-notify', { method: 'POST' });
         const data = await res.json();
@@ -1190,9 +1453,9 @@ function renderDashboardHtml({ state, deadMan, emailEnabled = false, telegramEna
             fb.style.background = '#065f46';
             fb.style.color = '#a7f3d0';
             const channels = (data.report?.successfulChannels && data.report.successfulChannels.length)
-              ? data.report.successfulChannels.join(', ')
+              ? data.report.successfulChannels.map((c) => channelLabels[c] || c).join(', ')
               : 'configured channels';
-            fb.innerText = '✓ Test notification sent successfully to: ' + channels + '! Check your Telegram, Email, and Browser.';
+            fb.innerText = '✓ Test notification sent successfully to: ' + channels + '!';
           } else if (res.status === 429) {
             fb.style.background = '#451a03';
             fb.style.color = '#fdba74';
